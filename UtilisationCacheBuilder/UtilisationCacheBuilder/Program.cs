@@ -14,11 +14,64 @@ namespace UtilisationCacheBuilder
         private static string ConnectionString = "Server=.;Database=Wayfinder_cba;Trusted_Connection=True";
 
         private static List<Metric> Metrics;
+        private static DateTime CurrentTimeUTC;
+        private static DateTime CurrentTimeWorldMax;
+        private static DateTime HourlyCacheLastUpdatedUTC;
+        private static DateTime MonthlyCacheLastUpdatedUTC;
 
         static void Main(string[] args)
         {
-            DateTime generateCacheFrom = new DateTime(2018, 07, 01);
-            DateTime generateCacheTo = new DateTime(2018, 07, 09);
+            Initialization();
+
+            //GenerateHourlyCache();
+
+            GenerateDailyCache();
+
+            // Update generateCacheFrom in database
+            using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
+            {
+                var checkStartDateSQL = "UPDATE [Configuration] SET [Value]='" + CurrentTimeUTC.ToString("yyyy/MM/dd HH:mm") + "' WHERE ConfigurationID=12008";
+                SqlCommand cmd = new SqlCommand(checkStartDateSQL, sqlConn);
+                cmd.Connection.Open();
+                cmd.ExecuteNonQuery();
+            }
+
+
+        }
+
+        private static void Initialization()
+        {
+            // Initialization
+            CurrentTimeUTC = new DateTime(2018, 07, 09, 0, 0,0);  //DateTime.UtcNow;
+            CurrentTimeUTC.AddMinutes(CurrentTimeUTC.Minute * -1); // remove minute component. 
+
+            CurrentTimeWorldMax = CurrentTimeUTC.AddHours(14); // the maximum time in the world right now is UTC+14
+
+            HourlyCacheLastUpdatedUTC = new DateTime(2018, 07, 01);
+            MonthlyCacheLastUpdatedUTC = HourlyCacheLastUpdatedUTC;
+
+            using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
+            {
+                var checkStartDateSQL = "SELECT ConfigurationID,Value FROM [Configuration] WHERE ConfigurationID IN (12008,12009)";
+                SqlCommand cmd = new SqlCommand(checkStartDateSQL, sqlConn);
+                cmd.Connection.Open();
+                var sqlReader = cmd.ExecuteReader();
+                while (sqlReader.Read())
+                {
+                    var id = sqlReader.GetInt32(0);
+                    var result = sqlReader.GetString(1);
+
+                    switch (id)
+                    {
+                        case 12008:
+                            DateTime.TryParse(result, out HourlyCacheLastUpdatedUTC);
+                            break;
+                        case 12009:
+                            DateTime.TryParse(result, out MonthlyCacheLastUpdatedUTC);
+                            break;
+                    }
+                }
+            }
 
             // create collection of Metrics that we're going to calculate. 
             Metrics = new List<Metric>();
@@ -36,18 +89,15 @@ namespace UtilisationCacheBuilder
             CreateMetricsTable("SpaceUtilisationPerDay", 1, 31);
             CreateMetricsTable("SpaceUtilisationPerWeekday", 1, 7);
             CreateMetricsTable("SpaceUtilisationPerMonth", 1, 12);
-
-            GenerateHourlyCache(generateCacheFrom, generateCacheTo);
-
-            //GenerateDailyCache(generateCacheFrom, generateCacheTo);
-
-
         }
 
-        private static void GenerateDailyCache(DateTime generateCacheFrom, DateTime generateCacheTo)
+
+        private static void GenerateDailyCache()
         {
+            DateTime generateCacheFrom = HourlyCacheLastUpdatedUTC.AddDays(-1);
+
             StringBuilder sb = new StringBuilder();
-            sb.Append(@"SELECT ContainerID,StartDate,
+            sb.Append(@"SELECT su.ContainerID,StartDate, tz.Name as 'TimeZone',
                 DATEFROMPARTS(YEAR(StartDate),1,1) as StartOfYear,
                 DATEFROMPARTS(YEAR(StartDate), MONTH(StartDate), 1) as StartofMonth,
                 DATEADD(ww, DATEDIFF(ww, 0, StartDate), 0) as StartOfWeek, ");
@@ -60,7 +110,7 @@ namespace UtilisationCacheBuilder
             }
 
 
-            sb.Append(" FROM [SpaceUtilisationPerHour]");
+            sb.Append(" FROM [SpaceUtilisationPerHour] su INNER JOIN [Container] c ON (su.ContainerID = c.ContainerID) INNER JOIN [Building] b ON (c.BuildingID = b.BuildingID) LEFT OUTER JOIN tzdb.Zones tz ON (b.TimeZoneID = tz.ID)  WHERE StartDate >='").Append(generateCacheFrom.ToString("yyyy/MM/dd HH:mm")).Append("'");
 
             Console.WriteLine(sb.ToString());
 
@@ -85,15 +135,15 @@ namespace UtilisationCacheBuilder
 
             var aggregatedTable = AggregateTable(table, "StartOfMonth", "SpaceUtilisationPerDay", 1, 31);
 
-            CommitCache2(generateCacheFrom, aggregatedTable);
+            CommitCache2(generateCacheFrom, aggregatedTable,1,31);
 
             //aggregatedTable = AggregateTable(table, "StartOfWeek", "SpaceUtilisationPerWeekday", 1, 7);
 
-            //CommitCache2(generateCacheFrom, aggregatedTable);
+            //CommitCache2(generateCacheFrom, aggregatedTable,1,7);
 
             //aggregatedTable = AggregateTable(table, "StartOfMonth", "SpaceUtilisationPerMonth", 1, 12);
 
-            //CommitCache2(generateCacheFrom, aggregatedTable);
+            //CommitCache2(generateCacheFrom, aggregatedTable,1,12);
 
 
         }
@@ -109,17 +159,20 @@ namespace UtilisationCacheBuilder
             DataTable newTable = new DataTable();
             newTable.Columns.Add("ContainerID", typeof(int));
             newTable.Columns.Add("StartDate", typeof(DateTime));
+            newTable.Columns.Add("MinCachedDateLocal", typeof(DateTime));
 
             AddMetricColumnsToTable(newTable, minValue, maxValue);
 
             var groupedTable = sourceTable.AsEnumerable()
-                            .GroupBy(r => new { ContainerID = r.Field<int>("ContainerID"), StartDate = r.Field<DateTime>(groupByDate) })
+                            .GroupBy(r => new { ContainerID = r.Field<int>("ContainerID"), StartDate = r.Field<DateTime>(groupByDate), Timezone = r.Field<string>("Timezone") })
                             .Select(g =>
                             {
                                 var newRow = newTable.NewRow();
 
                                 newRow["ContainerID"] = g.Key.ContainerID;
                                 newRow["StartDate"] = g.Key.StartDate;
+                                var timeZone = DateTimeZoneProviders.Tzdb[g.Key.Timezone];
+                                newRow["MinCachedDateLocal"] = Instant.FromDateTimeUtc(DateTime.SpecifyKind(HourlyCacheLastUpdatedUTC, DateTimeKind.Utc)).InZone(timeZone).ToDateTimeUnspecified(); ;
 
                                 for (int i = minValue; i <= maxValue; i++)
                                 {
@@ -178,10 +231,10 @@ namespace UtilisationCacheBuilder
         {
             if (metric.AggregateFunction == Metric.Function.Or)
             {
-                for (int hour = 0; hour <= 23; hour++)
+                for (int i = minValue; i <= maxValue; i++)
                 {
-                    sb.Append(metric.Abbreviation).Append(hour.ToString("D2"));
-                    if (hour != maxValue)
+                    sb.Append(metric.Abbreviation).Append(i.ToString("D2"));
+                    if (i != maxValue)
                         sb.Append("|");
                 }
                 sb.Append(" AS ").Append(metric.Abbreviation).Append(" ");
@@ -201,30 +254,39 @@ namespace UtilisationCacheBuilder
 
         }
 
-        private static void GenerateHourlyCache(DateTime generateCacheFrom, DateTime generateCacheTo)
+        private static void GenerateHourlyCache()
         {
-            var table = GetContainerOccupancyData(generateCacheFrom);
+            // Hourly Cache is updated for every hour. 
 
-            AddLocalTimezonesAndHelperDates(table);
-
-            AddMetricColumnsToTable(table, 0, 23);
-            AddMetricColumns(table, new Metric("Person ID", "PID", typeof(int), Metric.SqlType.Int, false, Metric.Function.CountDistinct), 0, 23); //PersonID this hour. 
-
-            for (int dayCount = 0; dayCount < generateCacheTo.Date.Subtract(generateCacheFrom.Date).TotalDays; dayCount++)
+            // To save on memory, process one UTC day's worth of data at a time. 
+            for (int dayCount = 0; dayCount <= CurrentTimeUTC.Date.Subtract(HourlyCacheLastUpdatedUTC.Date).TotalDays; dayCount++)
             {
-                DateTime startDate = generateCacheFrom.AddDays(dayCount);
+                //DateTime startDate = generateCacheFrom.AddDays(dayCount);
 
-                DataView dv = new DataView(table, "ActivityStartTimeLocal < '" + startDate.AddDays(1).ToString("yyyy/MM/dd") + "' AND ActivityEndTimeLocal >='" + startDate.ToString("yyyy/MM/dd") + "'", "", DataViewRowState.CurrentRows);
-                Console.WriteLine("Processing StartDate: " + startDate.ToShortDateString() + " with " + dv.Count + "Rows");
+                // Get ContainerOccupancy Data To Process
+                DateTime processDate = HourlyCacheLastUpdatedUTC.AddDays(dayCount);
+                DateTime maxDate = processDate.AddDays(1);
+                if (maxDate > CurrentTimeUTC)
+                    maxDate = CurrentTimeUTC;
+                var table = GetContainerOccupancyData(processDate,maxDate);
+
+                // Add Local Timezones & Helper Columns 
+                AddLocalTimezonesAndHelperDates(table);
+                AddMetricColumnsToTable(table, 0, 23);
+                AddMetricColumns(table, new Metric("Person ID", "PID", typeof(int), Metric.SqlType.Int, false, Metric.Function.CountDistinct), 0, 23); //PersonID this hour. 
+
+
+                //DataView dv = new DataView(table, "ActivityStartTimeLocal < '" + startDate.AddDays(1).ToString("yyyy/MM/dd") + "' AND ActivityEndTimeLocal >='" + startDate.ToString("yyyy/MM/dd") + "'", "", DataViewRowState.CurrentRows);
+                Console.WriteLine("Processing Hourly Data for: " + processDate.ToShortDateString() + " with " + table.Count + "Rows");
 
                 DataSet1.ContainerOccupancyRow row;
-                for (int i = 0; i < dv.Count; i++)
+                for (int i = 0; i < table.Rows.Count; i++)
                 {
                     if (i % 1000 == 0)
                         Console.WriteLine("Processed " + i + " rows");
 
-                    row = (DataSet1.ContainerOccupancyRow)dv[i].Row;
-                    row.StartDate = startDate;
+                    row = (DataSet1.ContainerOccupancyRow)table.Rows[i];
+                    row.StartDate = new DateTime(row.ActivityStartTimeLocal.Year, row.ActivityStartTimeLocal.Month, row.ActivityStartTimeLocal.Day);
 
                     for (int hour = 0; hour <= 23; hour++)
                     {
@@ -232,7 +294,7 @@ namespace UtilisationCacheBuilder
                         DateTime? utilisationStart = null;
                         if ((row.ActivityStartsPreviousDay || (row.ActivityStartedToday && row.ActivityStartTimeLocal.Hour < hour)) &&
                             (row.UtilisationEndsFutureDay || (row.ActivityStartedToday && row.UtilisationEndTimeLocal.Hour >= hour)))
-                            utilisationStart = new DateTime(startDate.Year, startDate.Month, startDate.Day, hour, 0, 0);
+                            utilisationStart = new DateTime(row.ActivityStartTimeLocal.Year, row.ActivityStartTimeLocal.Month, row.ActivityStartTimeLocal.Day, hour, 0, 0);
                         else if (row.ActivityStartedToday && row.ActivityStartTimeLocal.Hour == hour)
                             utilisationStart = row.ActivityStartTimeLocal;
 
@@ -249,7 +311,7 @@ namespace UtilisationCacheBuilder
                         if (utilisationStart != null)
                         {
                             if (row.UtilisationEndsFutureDay || (row.UtilisationEndsToday && row.UtilisationEndTimeLocal.Hour > hour))
-                                utilisationEnd = new DateTime(startDate.Year, startDate.Month, startDate.Day, hour, 59, 59);
+                                utilisationEnd = row.StartDate.AddHours(hour + 1);
                             else if (row.UtilisationEndsToday && row.UtilisationEndTimeLocal.Hour == hour)
                                 utilisationEnd = row.UtilisationEndTimeLocal;
 
@@ -257,16 +319,10 @@ namespace UtilisationCacheBuilder
                                 row["UET" + hour] = utilisationEnd;
                         }
 
-
-
-
                         // MIU - Minutes Utilized
                         int minutesUtilised = 0;
                         if (utilisationStart != null)
-                            minutesUtilised = utilisationEnd.Value.Minute - utilisationStart.Value.Minute;
-                        if (minutesUtilised > 60)
-                            Console.WriteLine("EEEK!!");
-
+                            minutesUtilised = Convert.ToInt32(Math.Ceiling(utilisationEnd.Value.Subtract(utilisationStart.Value).TotalMinutes));
                         row["MIU" + hour] = minutesUtilised;
 
                         // WPU - Workpoints Utilized
@@ -305,12 +361,26 @@ namespace UtilisationCacheBuilder
 
                 }
 
-                var filteredTable = table.AsEnumerable().Where(r => r.Field<DateTime?>("StartDate") != null).CopyToDataTable();
+                if (table.Rows.Count > 0)
+                {
+                    var filteredTable = table.AsEnumerable().Where(r => r.Field<DateTime?>("StartDate") != null).CopyToDataTable();
 
-                var groupedTable = AggregateTable(filteredTable, "StartDate", "SpaceUtilisationByHour", 0, 23);
+                    var groupedTable = AggregateTable(filteredTable, "StartDate", "SpaceUtilisationPerHour", 0, 23);
 
-                CommitCache(generateCacheFrom, groupedTable);
+                    CommitCache(HourlyCacheLastUpdatedUTC, groupedTable);
 
+                    filteredTable.Clear();
+                    groupedTable.Clear();
+                    filteredTable = null;
+                    groupedTable = null;
+                }
+
+                table.Clear();
+           
+                table.Dispose();
+              
+                table = null;
+         
             }
         }
 
@@ -326,19 +396,27 @@ namespace UtilisationCacheBuilder
         private static void CommitCache(DateTime generateCacheFrom, DataTable table)
         {
 
-            bool startDateExistsInCache = false;
+            Dictionary<int, DateTime> latestStartDateCachedForContainer = new Dictionary<int, DateTime>();
             using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
             {
-                var checkStartDateInCacheSQL = "SELECT COUNT(*) FROM [SpaceUtilisationPerHour] WHERE StartDate='" + generateCacheFrom.ToString("yyyy/MM/dd") + "'";
-                SqlCommand cmd = new SqlCommand(checkStartDateInCacheSQL, sqlConn);
-                cmd.Connection.Open();
-                startDateExistsInCache = (int)cmd.ExecuteScalar() > 0;
+                var getLatestCachedStartDatePerBuidlingSQL = @"select ContainerID,MAX(StartDate) as LatestCachedStartDate
+                    FROM[SpaceUtilisationPerHour]
+                    GROUP BY ContainerID";
+
+                using (SqlCommand cmd = new SqlCommand(getLatestCachedStartDatePerBuidlingSQL, sqlConn))
+                {
+                    sqlConn.Open();
+                    var sqlReader = cmd.ExecuteReader();
+                    while (sqlReader.Read())
+                    {
+                        latestStartDateCachedForContainer.Add((int)sqlReader["ContainerID"], (DateTime)sqlReader["LatestCachedStartDate"]);
+                    }
+                    sqlConn.Close();
+                }
+
             }
 
             var sb = new StringBuilder();
-
-            // Delete any cached data > generateCacheFrom date so that we don't have to write UPDATE statements for it. 
-            sb.Append("DELETE FROM [SpaceUtilisationPerHour] WHERE StartDate > '").Append(generateCacheFrom.ToString("yyyy/MM/dd")).Append("';");
 
             // Update rows where startDate already exists in cache. 
             DataRow row;
@@ -346,13 +424,30 @@ namespace UtilisationCacheBuilder
             {
                 row = table.Rows[rowCount];
 
-                if (startDateExistsInCache && (DateTime)row["startDate"] == generateCacheFrom.Date) // update that exist in cache
+                if (latestStartDateCachedForContainer.ContainsKey((int)row["ContainerID"]) &&
+                    (DateTime)row["StartDate"] <= latestStartDateCachedForContainer[(int)row["ContainerID"]] ) // update that exist in cache
                 {
-                    sb.Append("UPDATE [SpaceUtilisationPerHour] SET ");
+                    sb.Append("UPDATE [").Append(table.TableName).Append("] SET ");
 
-                    for (int hour = 0; hour < 23; hour++)
+                    int minHour = ((DateTime)row["MinCachedDateLocal"]).Hour;
+                    for (int i = minHour; i < 23; i++)
                     {
-                        sb.Append("[UTI").Append(hour.ToString("D2")).Append("]=").Append(((bool)row["UTI" + hour]) ? 1 : 0).Append(",");
+                        for (int m = 0; m < Metrics.Count; m++)
+                        {
+                            sb.Append("[").Append(Metrics[m].Abbreviation).Append(i.ToString("D2")).Append("]=");
+
+                            if (Metrics[m].SqlDataType == Metric.SqlType.Bit)
+                                sb.Append(((bool)row[Metrics[m].Abbreviation + i]) ? 1 : 0);
+                            else if (Metrics[m].SqlDataType == Metric.SqlType.Smalldatetime)
+                                if (row[Metrics[m].Abbreviation + i] != DBNull.Value)
+                                    sb.Append("'").Append(((DateTime)row[Metrics[m].Abbreviation + i]).ToString("yyyy/MM/dd HH:mm")).Append("'");
+                                else
+                                    sb.Append("null");
+                            else
+                                sb.Append(row[Metrics[m].Abbreviation + i]);
+
+                            sb.Append(",");
+                        }
                     }
 
                     sb.Remove(sb.Length - 1, 1);
@@ -362,13 +457,18 @@ namespace UtilisationCacheBuilder
                 }
             }
 
+            table.Columns.Remove("MinCachedDateLocal");
+
             using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
             {
                 sqlConn.Open();
 
                 // update rows where StartDate already exists in cache. 
-                SqlCommand cmd = new SqlCommand(sb.ToString(), sqlConn);
-                cmd.ExecuteNonQuery();
+                if (sb.Length > 0)
+                {
+                    SqlCommand cmd = new SqlCommand(sb.ToString(), sqlConn);
+                    cmd.ExecuteNonQuery();
+                }
 
                 // bulk insert remaining data
                 using (SqlBulkCopy bulkCopy = new SqlBulkCopy(sqlConn))
@@ -394,75 +494,106 @@ namespace UtilisationCacheBuilder
             }
         }
 
-        private static void CommitCache2(DateTime generateCacheFrom, DataTable table)
+        private static void CommitCache2(DateTime generateCacheFrom, DataTable table, int minValue, int maxValue)
         {
 
-            bool startDateExistsInCache = false;
+            Dictionary<int, DateTime> latestStartDateCachedForContainer = new Dictionary<int, DateTime>();
             using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
             {
-                var checkStartDateInCacheSQL = "SELECT COUNT(*) FROM [" + table.TableName + "] WHERE StartDate='" + generateCacheFrom.ToString("yyyy/MM/dd") + "'";
-                SqlCommand cmd = new SqlCommand(checkStartDateInCacheSQL, sqlConn);
-                cmd.Connection.Open();
-                startDateExistsInCache = (int)cmd.ExecuteScalar() > 0;
+                var getLatestCachedStartDatePerBuidlingSQL = @"select ContainerID,MAX(StartDate) as LatestCachedStartDate
+                    FROM[" + table.TableName + @"]
+                    GROUP BY ContainerID";
+
+                using (SqlCommand cmd = new SqlCommand(getLatestCachedStartDatePerBuidlingSQL, sqlConn))
+                {
+                    sqlConn.Open();
+                    var sqlReader = cmd.ExecuteReader();
+                    while (sqlReader.Read())
+                    {
+                        latestStartDateCachedForContainer.Add((int)sqlReader["ContainerID"], (DateTime)sqlReader["LatestCachedStartDate"]);
+                    }
+                    sqlConn.Close();
+                }
+
             }
+
 
             var sb = new StringBuilder();
 
-            // Delete any cached data > generateCacheFrom date so that we don't have to write UPDATE statements for it. 
-            sb.Append("DELETE FROM [" + table.TableName + "] WHERE StartDate > '").Append(generateCacheFrom.ToString("yyyy/MM/dd")).Append("';");
-
             // Update rows where startDate already exists in cache. 
-            //DataRow row;
-            //for (int rowCount = 0; rowCount < table.Rows.Count; rowCount++)
-            //{
-            //    row = table.Rows[rowCount];
-
-            //    if (startDateExistsInCache && (DateTime)row["startDate"] == generateCacheFrom.Date) // update that exist in cache
-            //    {
-            //        sb.Append("UPDATE [").Append(table.TableName).Append("] SET ");
-
-            //        for (int hour = 0; hour < 23; hour++)
-            //        {
-            //            sb.Append("[UTI").Append(hour.ToString("D2")).Append("]=").Append(((bool)row["UTI" + hour]) ? 1 : 0).Append(",");
-            //        }
-
-            //        sb.Remove(sb.Length - 1, 1);
-
-            //        sb.Append(" WHERE [ContainerID]=").Append(row["ContainerID"]).Append(" AND [StartDate] = '").Append(((DateTime)row["StartDate"]).ToString("yyyy/MM/dd")).Append("';");
-            //        row.Delete();
-            //    }
-            //}
-
-
-            using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
+            DataRow row;
+            for (int rowCount = 0; rowCount < table.Rows.Count; rowCount++)
             {
-                sqlConn.Open();
+                row = table.Rows[rowCount];
 
-                // update rows where StartDate already exists in cache. 
-                //SqlCommand cmd = new SqlCommand(sb.ToString(), sqlConn);
-                //cmd.ExecuteNonQuery();
-
-                // bulk insert remaining data
-                using (SqlBulkCopy bulkCopy = new SqlBulkCopy(sqlConn))
+                if (latestStartDateCachedForContainer.ContainsKey((int)row["ContainerID"]) &&
+                    (DateTime)row["StartDate"] <= latestStartDateCachedForContainer[(int)row["ContainerID"]]) // update that exist in cache
                 {
-                    bulkCopy.DestinationTableName = table.TableName;
-
-                    try
                     {
-                        bulkCopy.BatchSize = 1000;
-                        bulkCopy.WriteToServer(table);
+                        sb.Append("UPDATE [").Append(table.TableName).Append("] SET ");
 
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine(ex.Message);
-                    }
+                        int minHour = ((DateTime)row["MinCachedDateLocal"]).Day;
+                        for (int i = minHour; i < maxValue; i++)
+                        {
+                            for (int m = 0; m < Metrics.Count; m++)
+                            {
+                                sb.Append("[").Append(Metrics[m].Abbreviation).Append(i.ToString("D2")).Append("]=");
 
-                    Console.WriteLine("Committed " + table.Rows.Count + " Records");
+                                if (Metrics[m].SqlDataType == Metric.SqlType.Bit)
+                                    sb.Append(((bool)row[Metrics[m].Abbreviation + i]) ? 1 : 0);
+                                else if (Metrics[m].SqlDataType == Metric.SqlType.Smalldatetime)
+                                    if (row[Metrics[m].Abbreviation + i] != DBNull.Value)
+                                        sb.Append("'").Append(((DateTime)row[Metrics[m].Abbreviation + i]).ToString("yyyy/MM/dd HH:mm")).Append("'");
+                                    else
+                                        sb.Append("null");
+                                else
+                                    sb.Append(row[Metrics[m].Abbreviation + i]);
+
+                                sb.Append(",");
+                            }
+                        }
+
+                        sb.Remove(sb.Length - 1, 1);
+
+                        sb.Append(" WHERE [ContainerID]=").Append(row["ContainerID"]).Append(" AND [StartDate] = '").Append(((DateTime)row["StartDate"]).ToString("yyyy/MM/dd")).Append("';");
+                        row.Delete();
+                    }
                 }
 
-                sqlConn.Close();
+                if (table.Columns.Contains("MinCachedDateLocal"))
+                    table.Columns.Remove("MinCachedDateLocal");
 
+
+                using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
+                {
+                    sqlConn.Open();
+
+                    // update rows where StartDate already exists in cache. 
+                    //SqlCommand cmd = new SqlCommand(sb.ToString(), sqlConn);
+                    //cmd.ExecuteNonQuery();
+
+                    // bulk insert remaining data
+                    using (SqlBulkCopy bulkCopy = new SqlBulkCopy(sqlConn))
+                    {
+                        bulkCopy.DestinationTableName = table.TableName;
+
+                        try
+                        {
+                            bulkCopy.BatchSize = 1000;
+                            bulkCopy.WriteToServer(table);
+
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine(ex.Message);
+                        }
+
+                        Console.WriteLine("Committed " + table.Rows.Count + " Records");
+                    }
+
+                    sqlConn.Close();
+
+                }
             }
         }
 
@@ -483,7 +614,7 @@ namespace UtilisationCacheBuilder
 
             CreateMetricsColumns(sb, minValue, maxValue);
 
-            sb.Append(" CONSTRAINT PK_ContainerID_StartDate PRIMARY KEY CLUSTERED (ContainerID,StartDate))");
+            sb.Append(" CONSTRAINT PK_").Append(tableName).Append("_ContainerID_StartDate PRIMARY KEY CLUSTERED (ContainerID,StartDate))");
 
             using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
             {
@@ -550,7 +681,7 @@ namespace UtilisationCacheBuilder
 
 
 
-        private static DataSet1.ContainerOccupancyDataTable GetContainerOccupancyData(DateTime generateCacheFromTime)
+        private static DataSet1.ContainerOccupancyDataTable GetContainerOccupancyData(DateTime minDateUTC, DateTime maxDateUTC)
         {
             //class variable DataTable, so you can edit it later too!
             var table = new DataSet1.ContainerOccupancyDataTable();
@@ -561,38 +692,47 @@ namespace UtilisationCacheBuilder
                 //TODO: Fix Timezones
                 //TODO: Add Parameters
                 string sqlQuery =
-                    @"DECLARE @RegenerateFromLogoutTime datetime = '" + generateCacheFromTime.ToString("yyyy/MM/dd HH:mm") + @"'
+                    @"DECLARE @RegenerateFromLogoutTime datetime = '" + minDateUTC.ToString("yyyy/MM/dd HH:mm") + @"'
+                    DECLARE @RegenerateToLoginTime datetime = '" + maxDateUTC.ToString("yyyy/MM/dd HH:mm") + @"'
                     DECLARE @MinUtilisationMins as INT = 5
 
-                    SELECT 
-	                    coi.ContainerID,
-	                    coi.FloorID,
-	                    coi.BuildingID,
-	                    CONVERT(DateTime,LoginTime AT TIME ZONE 'AUS Eastern Standard Time' AT TIME ZONE 'UTC') as 'ActivityStartTimeUTC',
-	                    CONVERT(DateTime,LogoutTime AT TIME ZONE 'AUS Eastern Standard Time' AT TIME ZONE 'UTC') as 'ActivityEndTimeUTC',
-	                    UtilisationTypeID as 'ActivityTypeID',
-	                    ReferenceValueName as 'ActivityType',
-	                    CONVERT(DateTime,IIF( LEAD(LoginTime) OVER (PARTITION BY coi.ContainerID ORDER BY LoginTime) < LogoutTime,
-		                    LEAD(LoginTime) OVER (ORDER BY LoginTime), LogoutTime) AT TIME ZONE 'AUS Eastern Standard Time' AT TIME ZONE 'UTC') as 'UtilisationEndTimeUTC',
-	                    CONVERT(DateTime,IIF( LEAD(LoginTime) OVER (PARTITION BY coi.ContainerID, coi.OccupiedByPersonID ORDER BY LoginTime) < LogoutTime,
-		                    LEAD(LoginTime) OVER (ORDER BY LoginTime), LogoutTime) AT TIME ZONE 'AUS Eastern Standard Time' AT TIME ZONE 'UTC') as 'OccupancyEndTimeUTC',
-	                    OccupiedByPersonID,
-	                    up.UtilisationProviderID,
-	                    UtilisationProviderName,
-	                    UtilisationTypeID,
-	                    Workpoints,
-	                    Capacity,
-	                    tz.Name as 'TimeZone'
-                    FROM ContainerOccupancyIntermediate coi
-	                    INNER JOIN Container c ON (coi.ContainerID = c.ContainerID)
-	                    INNER JOIN Building b ON (c.BuildingID = b.BuildingID)
-	                    INNER JOIN UtilisationSource us ON (coi.UtilisationSourceID = us.UtilisationSourceID)
-	                    INNER JOIN UtilisationProvider up ON (us.UtilisationProviderID = up.UtilisationProviderID)
-	                    INNER JOIN ReferenceValue rv ON (coi.UtilisationTypeID = rv.ReferenceValueID)
-	                    LEFT OUTER JOIN tzdb.Zones tz ON (b.TimeZoneID = tz.ID)
-                    WHERE 
-	                    (LogoutTime >= @RegenerateFromLogoutTime OR LogoutTime IS NULL) -- Only select rows that were logged out since RegenerateFromLogoutTime
-		                     AND DATEDIFF(mi,LoginTime,LogoutTime) > @MinUtilisationMins -- Remove rows below Utilization Threshold";
+                     
+                    SELECT a.*,
+		                    LoginTimeUTC as 'ActivityStartTimeUTC',
+		                    LogoutTimeUTC as 'ActivityEndTimeUTC',
+		                    IIF( LEAD(LoginTimeUTC) OVER (PARTITION BY ContainerID ORDER BY LoginTimeUTC) < LogoutTimeUTC,
+			                    LEAD(LoginTimeUTC) OVER (ORDER BY LoginTimeUTC), LogoutTimeUTC) as 'UtilisationEndTimeUTC',
+		                    IIF( LEAD(LoginTimeUTC) OVER (PARTITION BY ContainerID, OccupiedByPersonID ORDER BY LoginTimeUTC) < LogoutTimeUTC,
+			                    LEAD(LoginTimeUTC) OVER (ORDER BY LoginTimeUTC), LogoutTimeUTC) as 'OccupancyEndTimeUTC'
+                    FROM 
+                    (
+	                    SELECT 
+		                    coi.ContainerID,
+		                    coi.FloorID,
+		                    LoginTimeUTC,
+		                    ISNULL(LogoutTimeUTC,GETUTCDATE()) as 'LogoutTimeUTC',
+		                    coi.BuildingID,
+		                    UtilisationTypeID as 'ActivityTypeID',
+		                    ReferenceValueName as 'ActivityType',
+		                    OccupiedByPersonID,
+		                    up.UtilisationProviderID,
+		                    UtilisationProviderName,
+		                    UtilisationTypeID,
+		                    Workpoints,
+		                    Capacity,
+		                    tz.Name as 'TimeZone'
+	                    FROM ContainerOccupancyIntermediate coi
+		                    INNER JOIN Container c ON (coi.ContainerID = c.ContainerID)
+		                    INNER JOIN Building b ON (c.BuildingID = b.BuildingID)
+		                    INNER JOIN UtilisationSource us ON (coi.UtilisationSourceID = us.UtilisationSourceID)
+		                    INNER JOIN UtilisationProvider up ON (us.UtilisationProviderID = up.UtilisationProviderID)
+		                    INNER JOIN ReferenceValue rv ON (coi.UtilisationTypeID = rv.ReferenceValueID)
+		                    LEFT OUTER JOIN tzdb.Zones tz ON (b.TimeZoneID = tz.ID)
+	                    WHERE 
+		                    (ISNULL(LogoutTimeUTC,GETUTCDATE()) >= @RegenerateFromLogoutTime) -- Only select rows that were logged out since RegenerateFromLogoutTime
+		                    AND LoginTimeUTC < @RegenerateToLoginTime
+		                    AND DATEDIFF(mi,LoginTime,LogoutTime) > @MinUtilisationMins -- Remove rows below Utilization Threshold
+                    ) as a ";
 
                 using (SqlCommand cmd = new SqlCommand(sqlQuery, sqlConn))
                 {
