@@ -12,6 +12,7 @@ namespace UtilisationCacheBuilder
     class Program
     {
         private static string ConnectionString = "Server=.;Database=Wayfinder_cba;Trusted_Connection=True";
+        private enum Aggregation { Hour,Day,Weekday,Month} 
 
         private static List<Metric> Metrics;
         private static DateTime CurrentTimeUTC;
@@ -25,7 +26,9 @@ namespace UtilisationCacheBuilder
 
             //GenerateHourlyCache();
 
-            GenerateDailyCache();
+            GenerateAggregatedTimeCache(Aggregation.Day);
+            GenerateAggregatedTimeCache(Aggregation.Weekday);
+            GenerateAggregatedTimeCache(Aggregation.Month);
 
             // Update generateCacheFrom in database
             using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
@@ -91,10 +94,34 @@ namespace UtilisationCacheBuilder
             CreateMetricsTable("SpaceUtilisationPerMonth", 1, 12);
         }
 
-
-        private static void GenerateDailyCache()
+        private static void GenerateAggregatedTimeCache(Aggregation aggregation)
         {
-            DateTime generateCacheFrom = HourlyCacheLastUpdatedUTC.AddDays(-1);
+            DateTime generateCacheFrom = HourlyCacheLastUpdatedUTC;
+            int minValue=0;
+            int maxValue=0;
+            string groupByDate="";
+
+            switch (aggregation)
+            {
+                case Aggregation.Day:
+                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddDays(-1);
+                    minValue = 1;
+                    maxValue = 31;
+                    groupByDate = "StartOfMonth";
+                    break;
+                case Aggregation.Weekday:
+                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddDays(-1);
+                    minValue = 1;
+                    maxValue = 7;
+                    groupByDate = "StartOfWeek";
+                    break;
+                case Aggregation.Month:
+                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddMonths(-1);
+                    minValue = 1;
+                    maxValue = 12;
+                    groupByDate = "StartOfYear";
+                    break;
+            }
 
             StringBuilder sb = new StringBuilder();
             sb.Append(@"SELECT su.ContainerID,StartDate, tz.Name as 'TimeZone',
@@ -109,42 +136,42 @@ namespace UtilisationCacheBuilder
                     sb.Append(",");
             }
 
-
             sb.Append(" FROM [SpaceUtilisationPerHour] su INNER JOIN [Container] c ON (su.ContainerID = c.ContainerID) INNER JOIN [Building] b ON (c.BuildingID = b.BuildingID) LEFT OUTER JOIN tzdb.Zones tz ON (b.TimeZoneID = tz.ID)  WHERE StartDate >='").Append(generateCacheFrom.ToString("yyyy/MM/dd HH:mm")).Append("'");
 
-            Console.WriteLine(sb.ToString());
+            var table = GetData(sb.ToString());
 
+            AddMetricColumnsToTable(table, minValue, maxValue);
+
+            PivotTable(table, aggregation);
+
+            var aggregatedTable = AggregateTable(table, groupByDate, "SpaceUtilisationPer" + aggregation, minValue, maxValue, generateCacheFrom);
+
+            CommitCache2(generateCacheFrom, aggregatedTable, minValue, maxValue);
+        }
+
+        private static DataTable GetData(string sql)
+        {
             DataTable table = new DataTable();
             using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
             {
-                using (SqlCommand cmd = new SqlCommand(sb.ToString(), sqlConn))
+                using (SqlCommand cmd = new SqlCommand(sql, sqlConn))
                 {
                     SqlDataAdapter da = new SqlDataAdapter(cmd);
                     da.Fill(table);
                 }
             }
+            return table;
+        }
 
-            AddMetricColumnsToTable(table, 1, 31);
 
 
+        private static void PivotTable(DataTable table, Aggregation aggregation)
+        {
             foreach (DataRow row in table.Rows)
             {
                 foreach (Metric metric in Metrics)
-                    PivotValue(row, metric);
+                    PivotValue(row, metric,aggregation);
             }
-
-            var aggregatedTable = AggregateTable(table, "StartOfMonth", "SpaceUtilisationPerDay", 1, 31);
-
-            CommitCache2(generateCacheFrom, aggregatedTable,1,31);
-
-            //aggregatedTable = AggregateTable(table, "StartOfWeek", "SpaceUtilisationPerWeekday", 1, 7);
-
-            //CommitCache2(generateCacheFrom, aggregatedTable,1,7);
-
-            //aggregatedTable = AggregateTable(table, "StartOfMonth", "SpaceUtilisationPerMonth", 1, 12);
-
-            //CommitCache2(generateCacheFrom, aggregatedTable,1,12);
-
 
         }
 
@@ -154,7 +181,7 @@ namespace UtilisationCacheBuilder
                 AddMetricColumns(table, metric, minValue, maxValue);
         }
 
-        private static DataTable AggregateTable(DataTable sourceTable, string groupByDate, string newTableName, int minValue, int maxValue)
+        private static DataTable AggregateTable(DataTable sourceTable, string groupByDate, string newTableName, int minValue, int maxValue, DateTime generateCacheFrom)
         {
             DataTable newTable = new DataTable();
             newTable.Columns.Add("ContainerID", typeof(int));
@@ -172,7 +199,7 @@ namespace UtilisationCacheBuilder
                                 newRow["ContainerID"] = g.Key.ContainerID;
                                 newRow["StartDate"] = g.Key.StartDate;
                                 var timeZone = DateTimeZoneProviders.Tzdb[g.Key.Timezone];
-                                newRow["MinCachedDateLocal"] = Instant.FromDateTimeUtc(DateTime.SpecifyKind(HourlyCacheLastUpdatedUTC, DateTimeKind.Utc)).InZone(timeZone).ToDateTimeUnspecified(); ;
+                                newRow["MinCachedDateLocal"] = Instant.FromDateTimeUtc(DateTime.SpecifyKind(generateCacheFrom, DateTimeKind.Utc)).InZone(timeZone).ToDateTimeUnspecified(); ;
 
                                 for (int i = minValue; i <= maxValue; i++)
                                 {
@@ -217,14 +244,28 @@ namespace UtilisationCacheBuilder
 
         }
 
-        private static void PivotValue(DataRow row, Metric metric)
-        {
-            PivotValue(row, metric.Abbreviation);
-        }
-        private static void PivotValue(DataRow row, string metric)
+        private static void PivotValue(DataRow row, Metric metric, Aggregation aggregation)
         {
             DateTime startDate = (DateTime)row["StartDate"];
-            row[metric + startDate.Day] = row[metric];
+            switch (aggregation)
+            {
+                case Aggregation.Day:
+                    row[metric.Abbreviation + startDate.Day] = row[metric.Abbreviation];
+                    break;
+                case Aggregation.Weekday:
+                    row[metric.Abbreviation + GetDayOfWeek(startDate.DayOfWeek)] = row[metric.Abbreviation];
+                    break;
+                case Aggregation.Month:
+                    row[metric.Abbreviation + startDate.Month] = row[metric.Abbreviation];
+                    break;
+            }
+            
+        }
+
+        private static int GetDayOfWeek(DayOfWeek dayOfWeek)
+        {
+            int dayOfWeekValue = Convert.ToInt32(dayOfWeek);
+            return dayOfWeekValue == 0 ? 7 : dayOfWeekValue;
         }
 
         private static void AppendMultiColumnAggregate(StringBuilder sb, Metric metric, int minValue, int maxValue)
@@ -365,9 +406,9 @@ namespace UtilisationCacheBuilder
                 {
                     var filteredTable = table.AsEnumerable().Where(r => r.Field<DateTime?>("StartDate") != null).CopyToDataTable();
 
-                    var groupedTable = AggregateTable(filteredTable, "StartDate", "SpaceUtilisationPerHour", 0, 23);
+                    var groupedTable = AggregateTable(filteredTable, "StartDate", "SpaceUtilisationPerHour", 0, 23,HourlyCacheLastUpdatedUTC);
 
-                    CommitCache(HourlyCacheLastUpdatedUTC, groupedTable);
+                    CommitCache2(HourlyCacheLastUpdatedUTC, groupedTable,0,23);
 
                     filteredTable.Clear();
                     groupedTable.Clear();
@@ -530,70 +571,94 @@ namespace UtilisationCacheBuilder
                     (DateTime)row["StartDate"] <= latestStartDateCachedForContainer[(int)row["ContainerID"]]) // update that exist in cache
                 {
                     {
-                        sb.Append("UPDATE [").Append(table.TableName).Append("] SET ");
 
-                        int minHour = ((DateTime)row["MinCachedDateLocal"]).Day;
-                        for (int i = minHour; i < maxValue; i++)
+                        int minRecord = 0;
+                        switch (maxValue)
                         {
-                            for (int m = 0; m < Metrics.Count; m++)
-                            {
-                                sb.Append("[").Append(Metrics[m].Abbreviation).Append(i.ToString("D2")).Append("]=");
+                            case 23:
+                                minRecord = ((DateTime)row["MinCachedDateLocal"]).Hour;
+                                break;
+                            case 7:
+                                minRecord = GetDayOfWeek( ((DateTime)row["MinCachedDateLocal"]).DayOfWeek);
+                                break;
+                            case 31:
+                                minRecord = ((DateTime)row["MinCachedDateLocal"]).Day;
+                                break;
+                            case 12:
+                                minRecord = ((DateTime)row["MinCachedDateLocal"]).Month;
+                                break;
 
-                                if (Metrics[m].SqlDataType == Metric.SqlType.Bit)
-                                    sb.Append(((bool)row[Metrics[m].Abbreviation + i]) ? 1 : 0);
-                                else if (Metrics[m].SqlDataType == Metric.SqlType.Smalldatetime)
-                                    if (row[Metrics[m].Abbreviation + i] != DBNull.Value)
-                                        sb.Append("'").Append(((DateTime)row[Metrics[m].Abbreviation + i]).ToString("yyyy/MM/dd HH:mm")).Append("'");
-                                    else
-                                        sb.Append("null");
-                                else
-                                    sb.Append(row[Metrics[m].Abbreviation + i]);
-
-                                sb.Append(",");
-                            }
                         }
 
-                        sb.Remove(sb.Length - 1, 1);
+                        if (minRecord != maxValue)
+                        {
+                            sb.Append("UPDATE [").Append(table.TableName).Append("] SET ");
 
-                        sb.Append(" WHERE [ContainerID]=").Append(row["ContainerID"]).Append(" AND [StartDate] = '").Append(((DateTime)row["StartDate"]).ToString("yyyy/MM/dd")).Append("';");
+                            for (int i = minRecord; i < maxValue; i++)
+                            {
+                                for (int m = 0; m < Metrics.Count; m++)
+                                {
+                                    sb.Append("[").Append(Metrics[m].Abbreviation).Append(i.ToString("D2")).Append("]=");
+
+                                    if (Metrics[m].SqlDataType == Metric.SqlType.Bit)
+                                        sb.Append(((bool)row[Metrics[m].Abbreviation + i]) ? 1 : 0);
+                                    else if (Metrics[m].SqlDataType == Metric.SqlType.Smalldatetime)
+                                        if (row[Metrics[m].Abbreviation + i] != DBNull.Value)
+                                            sb.Append("'").Append(((DateTime)row[Metrics[m].Abbreviation + i]).ToString("yyyy/MM/dd HH:mm")).Append("'");
+                                        else
+                                            sb.Append("null");
+                                    else
+                                        sb.Append(row[Metrics[m].Abbreviation + i]);
+
+                                    sb.Append(",");
+                                }
+                            }
+
+                            sb.Remove(sb.Length - 1, 1);
+
+                            sb.Append(" WHERE [ContainerID]=").Append(row["ContainerID"]).Append(" AND [StartDate] = '").Append(((DateTime)row["StartDate"]).ToString("yyyy/MM/dd")).Append("';");
+
+                        }
                         row.Delete();
                     }
                 }
+            }
 
-                if (table.Columns.Contains("MinCachedDateLocal"))
-                    table.Columns.Remove("MinCachedDateLocal");
+            table.Columns.Remove("MinCachedDateLocal");
 
 
-                using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
+            using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
+            {
+                sqlConn.Open();
+
+                // update rows where StartDate already exists in cache. 
+                if (sb.Length > 0)
                 {
-                    sqlConn.Open();
+                    SqlCommand cmd = new SqlCommand(sb.ToString(), sqlConn);
+                    cmd.ExecuteNonQuery();
+                }
 
-                    // update rows where StartDate already exists in cache. 
-                    //SqlCommand cmd = new SqlCommand(sb.ToString(), sqlConn);
-                    //cmd.ExecuteNonQuery();
+                // bulk insert remaining data
+                using (SqlBulkCopy bulkCopy = new SqlBulkCopy(sqlConn))
+                {
+                    bulkCopy.DestinationTableName = table.TableName;
 
-                    // bulk insert remaining data
-                    using (SqlBulkCopy bulkCopy = new SqlBulkCopy(sqlConn))
+                    try
                     {
-                        bulkCopy.DestinationTableName = table.TableName;
+                        bulkCopy.BatchSize = 1000;
+                        bulkCopy.WriteToServer(table);
 
-                        try
-                        {
-                            bulkCopy.BatchSize = 1000;
-                            bulkCopy.WriteToServer(table);
-
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine(ex.Message);
-                        }
-
-                        Console.WriteLine("Committed " + table.Rows.Count + " Records");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(ex.Message);
                     }
 
-                    sqlConn.Close();
-
+                    Console.WriteLine("Committed " + table.Rows.Count + " Records");
                 }
+
+                sqlConn.Close();
+
             }
         }
 
