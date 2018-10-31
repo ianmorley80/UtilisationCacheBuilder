@@ -12,7 +12,8 @@ namespace UtilisationCacheBuilder
     class Program
     {
         private static string ConnectionString = "Server=.;Database=Wayfinder_cba;Trusted_Connection=True";
-        private enum Aggregation { Hour,Day,Weekday,Month} 
+        private enum TimeAggregation { Hour,Day,Weekday,Month} 
+        private enum LocationAggregation { Floor, Building }
 
         private static List<Metric> Metrics;
         private static DateTime CurrentTimeUTC;
@@ -20,26 +21,49 @@ namespace UtilisationCacheBuilder
         private static DateTime HourlyCacheLastUpdatedUTC;
         private static DateTime MonthlyCacheLastUpdatedUTC;
 
+        private enum CachePeriod { Hourly, Monthly}
+
         static void Main(string[] args)
         {
             Initialization();
 
-            //GenerateHourlyCache();
+            GenerateHourlyCache();
 
-            GenerateAggregatedTimeCache(Aggregation.Day);
-            GenerateAggregatedTimeCache(Aggregation.Weekday);
-            GenerateAggregatedTimeCache(Aggregation.Month);
+            return; 
 
+            GenerateAggregatedTimeCache(TimeAggregation.Day);
+            GenerateAggregatedTimeCache(TimeAggregation.Weekday);
+            SetCacheLastUpdated(CachePeriod.Hourly);
+
+            // Only generate monthly if the month has changed. 
+            if (CurrentTimeWorldMax.Month > MonthlyCacheLastUpdatedUTC.Month || CurrentTimeWorldMax.Year > MonthlyCacheLastUpdatedUTC.Year)
+            {
+                GenerateAggregatedTimeCache(TimeAggregation.Month);
+                SetCacheLastUpdated(CachePeriod.Monthly);
+            }
+
+        }
+
+        private static void SetCacheLastUpdated(CachePeriod cachePeriod)
+        {
+            int configurationID = 0;
+            switch (cachePeriod)
+            {
+                case CachePeriod.Hourly:
+                    configurationID = 12008;
+                    break;
+                case CachePeriod.Monthly:
+                    configurationID = 12009;
+                    break;
+            }
             // Update generateCacheFrom in database
             using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
             {
-                var checkStartDateSQL = "UPDATE [Configuration] SET [Value]='" + CurrentTimeUTC.ToString("yyyy/MM/dd HH:mm") + "' WHERE ConfigurationID=12008";
+                var checkStartDateSQL = "UPDATE [Configuration] SET [Value]='" + CurrentTimeUTC.ToString("yyyy/MM/dd HH:mm") + "' WHERE ConfigurationID=" + configurationID;
                 SqlCommand cmd = new SqlCommand(checkStartDateSQL, sqlConn);
                 cmd.Connection.Open();
                 cmd.ExecuteNonQuery();
             }
-
-
         }
 
         private static void Initialization()
@@ -50,7 +74,7 @@ namespace UtilisationCacheBuilder
 
             CurrentTimeWorldMax = CurrentTimeUTC.AddHours(14); // the maximum time in the world right now is UTC+14
 
-            HourlyCacheLastUpdatedUTC = new DateTime(2018, 07, 01);
+            HourlyCacheLastUpdatedUTC = CurrentTimeUTC.AddMonths(-3).AddDays(CurrentTimeUTC.Day * -1).AddHours(CurrentTimeUTC.Hour * -1).AddMinutes(CurrentTimeUTC.Minute * -1); // by default go back 3 months. 
             MonthlyCacheLastUpdatedUTC = HourlyCacheLastUpdatedUTC;
 
             using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
@@ -78,45 +102,129 @@ namespace UtilisationCacheBuilder
 
             // create collection of Metrics that we're going to calculate. 
             Metrics = new List<Metric>();
-            Metrics.Add(new Metric("Utilisation Start Time", "UST", typeof(DateTime), Metric.SqlType.Smalldatetime, true, Metric.Function.Min));
-            Metrics.Add(new Metric("Utilisation End Time", "UET", typeof(DateTime), Metric.SqlType.Smalldatetime, true, Metric.Function.Max));
-            Metrics.Add(new Metric("Utilised", "UTI", typeof(bool), Metric.SqlType.Bit, false, Metric.Function.Or));
-            Metrics.Add(new Metric("Minutes Utilised", "MIU", typeof(int), Metric.SqlType.Int, false, Metric.Function.Sum));
-            Metrics.Add(new Metric("Workpoints Utilised", "WPU", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.Max));
-            Metrics.Add(new Metric("Collaboration Spaces Utilised", "CSU", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.Max));
-            Metrics.Add(new Metric("Occupancy Minutes", "OCM", typeof(int), Metric.SqlType.Int, false, Metric.Function.Sum));
-            Metrics.Add(new Metric("Peak Occupancy", "PKO", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.Max));
+            Metrics.Add(new Metric("Utilisation Start Time", "UST", typeof(DateTime), Metric.SqlType.Smalldatetime, true, Metric.Function.Min,Metric.Function.Min));
+            Metrics.Add(new Metric("Utilisation End Time", "UET", typeof(DateTime), Metric.SqlType.Smalldatetime, true, Metric.Function.Max,Metric.Function.Max));
+            Metrics.Add(new Metric("Utilised", "UTI", typeof(bool), Metric.SqlType.Bit, false, Metric.Function.Or, Metric.Function.Or));
+            Metrics.Add(new Metric("Minutes Utilised", "MIU", typeof(int), Metric.SqlType.Int, false, Metric.Function.Sum,Metric.Function.Sum));
+            Metrics.Add(new Metric("Workpoints Utilised", "WPU", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.Max,Metric.Function.Sum));
+            Metrics.Add(new Metric("Collaboration Spaces Utilised", "CSU", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.Max,Metric.Function.Sum));
+            Metrics.Add(new Metric("Occupancy Minutes", "OCM", typeof(int), Metric.SqlType.Int, false, Metric.Function.Sum,Metric.Function.Sum));
+            Metrics.Add(new Metric("Peak Occupancy", "PKO", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.CountDistinct, Metric.Function.CountDistinct));
+            Metrics.Add(new Metric("Attendance", "ATT", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.CountDistinct, Metric.Function.CountDistinct));
+            Metrics.Add(new Metric("Workpoints", "WPS", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.Max, Metric.Function.Sum));
+            Metrics.Add(new Metric("Collaboration Spaces", "CLS", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.Max, Metric.Function.Sum));
+            Metrics.Add(new Metric("Peak Workpoints Utilised", "PWU", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.None, Metric.Function.Max));
+            Metrics.Add(new Metric("Average Workpoints Utilised", "AWU", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.None, Metric.Function.Avg));
+            Metrics.Add(new Metric("Peak Collaboration Spaces Utilised", "PCU", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.None, Metric.Function.Max));
+            Metrics.Add(new Metric("Average Collaboration Spaces Utilised", "ACU", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.None, Metric.Function.Avg));
+
+
 
             // Create Database Tables to store cached data (if they don't already exist)
-            CreateMetricsTable("SpaceUtilisationPerHour", 0, 23);
-            CreateMetricsTable("SpaceUtilisationPerDay", 1, 31);
-            CreateMetricsTable("SpaceUtilisationPerWeekday", 1, 7);
-            CreateMetricsTable("SpaceUtilisationPerMonth", 1, 12);
+            CreateMetricsTable("SpaceUtilisationPerHour","ContainerID", 0, 23);
+            CreateMetricsTable("SpaceUtilisationPerDay", "ContainerID", 1, 31);
+            CreateMetricsTable("SpaceUtilisationPerWeekday", "ContainerID", 1, 7);
+            CreateMetricsTable("SpaceUtilisationPerMonth", "ContainerID", 1, 12);
+
+            CreateMetricsTable("SpaceUtilisationByFloorPerHour","FloorID", 0, 23);
+            CreateMetricsTable("SpaceUtilisationByFloorPerDay", "FloorID", 1, 31);
+            CreateMetricsTable("SpaceUtilisationByFloorPerWeekday", "FloorID", 1, 7);
+            CreateMetricsTable("SpaceUtilisationByFloorPerMonth", "FloorID", 1, 12);
+
+            CreateMetricsTable("SpaceUtilisationByBuildingPerHour", "BuildingID", 0, 23);
+            CreateMetricsTable("SpaceUtilisationByBuildingPerDay", "BuildingID", 1, 31);
+            CreateMetricsTable("SpaceUtilisationByBuildingPerWeekday", "BuildingID", 1, 7);
+            CreateMetricsTable("SpaceUtilisationByBuildingPerMonth", "BuildingID", 1, 12);
         }
 
-        private static void GenerateAggregatedTimeCache(Aggregation aggregation)
+        private static void GenerateAggregatedLocationCache(LocationAggregation locationAggregation, DateTime generateCacheFrom, TimeAggregation timeAggregation)
+        {
+            int minValue = 0;
+            int maxValue = 0;
+            switch (timeAggregation)
+            {
+                case (TimeAggregation.Hour):
+                    minValue = 0;
+                    maxValue = 23;
+                    break;
+                case (TimeAggregation.Day):
+                    minValue = 1;
+                    maxValue = 31;
+                    break;
+                case (TimeAggregation.Weekday):
+                    minValue = 1;
+                    maxValue = 7;
+                    break;
+                case (TimeAggregation.Month):
+                    minValue = 1;
+                    maxValue = 12;
+                    break;
+            }
+
+
+            StringBuilder sb = new StringBuilder();
+
+            sb.Append("SELECT ").Append(locationAggregation).Append("ID,StartDate,");
+
+            var metrics = Metrics.Where(r => r.TimeAggregateFunction != Metric.Function.CountDistinct).Select(r => r).ToList<Metric>();
+            
+            for (int i = 0; i < metrics.Count; i++)
+            {
+
+                for (int v=minValue; v <=maxValue; v++)
+                {
+                    if (metrics[i].LocationAggregateFunction == Metric.Function.Or)
+                        sb.Append("CAST(MAX(CAST([").Append(metrics[i].Abbreviation).Append(v.ToString("D2")).Append("] as tinyint)) as bit) as ").Append(metrics[i].Abbreviation).Append(v.ToString("D2"));
+                    else
+                        sb.Append(metrics[i].LocationAggregateFunction).Append("([").Append(metrics[i].Abbreviation).Append(v.ToString("D2")).Append("]) as ").Append(metrics[i].Abbreviation).Append(v.ToString("D2"));
+                    if (v != maxValue)
+                        sb.Append(",");
+                }
+                if (i != metrics.Count - 1)
+                    sb.Append(",");
+            }
+
+            sb.Append(@" FROM SpaceUtilisationPer").Append(timeAggregation).Append(@" su
+                INNER JOIN Container c ON(su.ContainerID = c.ContainerID)
+                WHERE StartDate >= '2018-05-30'
+                GROUP BY ").Append(locationAggregation).Append("ID, StartDate");
+
+            DataTable table = GetData(sb.ToString());
+            table.TableName = "SpaceUtilisationBy" + locationAggregation + "Per" + timeAggregation;
+            table.PrimaryKey = new DataColumn[] { table.Columns[locationAggregation + "ID"], table.Columns["StartDate"] };
+
+            DataTable attendanceTable  = GetAttendanceData(generateCacheFrom,timeAggregation,locationAggregation);
+            table.Merge(attendanceTable);
+
+            CommitCache2(generateCacheFrom, table, minValue, maxValue);
+
+        }
+
+        private static void GenerateAggregatedTimeCache(TimeAggregation timeAggregation)
         {
             DateTime generateCacheFrom = HourlyCacheLastUpdatedUTC;
             int minValue=0;
             int maxValue=0;
             string groupByDate="";
 
-            switch (aggregation)
+            switch (timeAggregation)
             {
-                case Aggregation.Day:
-                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddDays(-1);
+                case TimeAggregation.Day:
+                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddHours(-36); // Max UTC offset of -12 then another day
+                    generateCacheFrom = generateCacheFrom.AddHours(generateCacheFrom.Hour * -1); // start of that day. 
                     minValue = 1;
                     maxValue = 31;
                     groupByDate = "StartOfMonth";
                     break;
-                case Aggregation.Weekday:
-                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddDays(-1);
+                case TimeAggregation.Weekday:
+                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddHours(-36); // Max UTC offset of -12 then another day
+                    generateCacheFrom = generateCacheFrom.AddHours(generateCacheFrom.Hour * -1); // start of that day. 
                     minValue = 1;
                     maxValue = 7;
                     groupByDate = "StartOfWeek";
                     break;
-                case Aggregation.Month:
-                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddMonths(-1);
+                case TimeAggregation.Month:
+                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddMonths(-1).AddDays(HourlyCacheLastUpdatedUTC.Day).AddHours(HourlyCacheLastUpdatedUTC.Hour).AddMinutes(HourlyCacheLastUpdatedUTC.Minute);
                     minValue = 1;
                     maxValue = 12;
                     groupByDate = "StartOfYear";
@@ -127,26 +235,33 @@ namespace UtilisationCacheBuilder
             sb.Append(@"SELECT su.ContainerID,StartDate, tz.Name as 'TimeZone',
                 DATEFROMPARTS(YEAR(StartDate),1,1) as StartOfYear,
                 DATEFROMPARTS(YEAR(StartDate), MONTH(StartDate), 1) as StartofMonth,
-                DATEADD(ww, DATEDIFF(ww, 0, StartDate), 0) as StartOfWeek, ");
+                DATEADD(ww, DATEDIFF(ww, 0, StartDate), 0) as StartOfWeek");
 
             for (int i = 0; i < Metrics.Count; i++)
             {
                 AppendMultiColumnAggregate(sb, Metrics[i], 0, 23);
-                if (i != Metrics.Count - 1)
-                    sb.Append(",");
             }
 
             sb.Append(" FROM [SpaceUtilisationPerHour] su INNER JOIN [Container] c ON (su.ContainerID = c.ContainerID) INNER JOIN [Building] b ON (c.BuildingID = b.BuildingID) LEFT OUTER JOIN tzdb.Zones tz ON (b.TimeZoneID = tz.ID)  WHERE StartDate >='").Append(generateCacheFrom.ToString("yyyy/MM/dd HH:mm")).Append("'");
 
+            Console.WriteLine("Prosessing Aggregate Data for " + timeAggregation + " beginning " + generateCacheFrom);
+
             var table = GetData(sb.ToString());
+
 
             AddMetricColumnsToTable(table, minValue, maxValue);
 
-            PivotTable(table, aggregation);
+            PivotTable(table, timeAggregation);
 
-            var aggregatedTable = AggregateTable(table, groupByDate, "SpaceUtilisationPer" + aggregation, minValue, maxValue, generateCacheFrom);
+            var aggregatedTable = AggregateTable(table, "ContainerID", groupByDate, "SpaceUtilisationPer" + timeAggregation, minValue, maxValue, generateCacheFrom);
 
             CommitCache2(generateCacheFrom, aggregatedTable, minValue, maxValue);
+
+            // GenerateLocationCache
+            GenerateAggregatedLocationCache(LocationAggregation.Floor, generateCacheFrom, timeAggregation);
+            GenerateAggregatedLocationCache(LocationAggregation.Building, generateCacheFrom, timeAggregation);
+
+
         }
 
         private static DataTable GetData(string sql)
@@ -165,7 +280,7 @@ namespace UtilisationCacheBuilder
 
 
 
-        private static void PivotTable(DataTable table, Aggregation aggregation)
+        private static void PivotTable(DataTable table, TimeAggregation aggregation)
         {
             foreach (DataRow row in table.Rows)
             {
@@ -177,45 +292,55 @@ namespace UtilisationCacheBuilder
 
         private static void AddMetricColumnsToTable(DataTable table, int minValue, int maxValue)
         {
-            foreach (Metric metric in Metrics)
+            AddMetricColumnsToTable(table, minValue, maxValue, Metrics);
+        }
+
+        private static void AddMetricColumnsToTable(DataTable table, int minValue, int maxValue, List<Metric> metrics)
+        {
+            foreach (Metric metric in metrics)
                 AddMetricColumns(table, metric, minValue, maxValue);
         }
 
-        private static DataTable AggregateTable(DataTable sourceTable, string groupByDate, string newTableName, int minValue, int maxValue, DateTime generateCacheFrom)
+        private static DataTable AggregateTable(DataTable sourceTable, string groupByLocationID, string groupByDate, string newTableName, int minValue, int maxValue, DateTime generateCacheFrom)
+        {
+            return AggregateTable(sourceTable, groupByLocationID, groupByDate, newTableName, minValue, maxValue, generateCacheFrom,Metrics);
+        }
+
+        private static DataTable AggregateTable(DataTable sourceTable, string groupByLocationID, string groupByDate, string newTableName, int minValue, int maxValue, DateTime generateCacheFrom,List<Metric> metrics)
         {
             DataTable newTable = new DataTable();
-            newTable.Columns.Add("ContainerID", typeof(int));
+            newTable.Columns.Add(groupByLocationID, typeof(int));
             newTable.Columns.Add("StartDate", typeof(DateTime));
             newTable.Columns.Add("MinCachedDateLocal", typeof(DateTime));
 
-            AddMetricColumnsToTable(newTable, minValue, maxValue);
+            AddMetricColumnsToTable(newTable, minValue, maxValue,metrics);
 
             var groupedTable = sourceTable.AsEnumerable()
-                            .GroupBy(r => new { ContainerID = r.Field<int>("ContainerID"), StartDate = r.Field<DateTime>(groupByDate), Timezone = r.Field<string>("Timezone") })
+                            .GroupBy(r => new { LocationID = r.Field<int>(groupByLocationID), StartDate = r.Field<DateTime>(groupByDate), Timezone = r.Field<string>("Timezone") })
                             .Select(g =>
                             {
                                 var newRow = newTable.NewRow();
 
-                                newRow["ContainerID"] = g.Key.ContainerID;
+                                newRow[groupByLocationID] = g.Key.LocationID;
                                 newRow["StartDate"] = g.Key.StartDate;
                                 var timeZone = DateTimeZoneProviders.Tzdb[g.Key.Timezone];
                                 newRow["MinCachedDateLocal"] = Instant.FromDateTimeUtc(DateTime.SpecifyKind(generateCacheFrom, DateTimeKind.Utc)).InZone(timeZone).ToDateTimeUnspecified(); ;
 
                                 for (int i = minValue; i <= maxValue; i++)
                                 {
-                                    foreach (Metric metric in Metrics)
+                                    foreach (Metric metric in metrics)
                                     {
                                         if (metric.AllowNulls)
                                         {
                                             if (metric.DataType == typeof(DateTime))
                                             {
-                                                if (metric.AggregateFunction == Metric.Function.Min)
+                                                if (metric.TimeAggregateFunction == Metric.Function.Min)
                                                 {
                                                     DateTime? value = g.Min(r => r.Field<DateTime?>(metric.Abbreviation + i));
                                                     if (value != null)
                                                         newRow[metric.Abbreviation + i] = value;
                                                 }
-                                                else if (metric.AggregateFunction == Metric.Function.Max)
+                                                else if (metric.TimeAggregateFunction == Metric.Function.Max)
                                                 {
                                                     DateTime? value = g.Max(r => r.Field<DateTime?>(metric.Abbreviation + i));
                                                     if (value != null)
@@ -225,10 +350,12 @@ namespace UtilisationCacheBuilder
                                         }
                                         else
                                         {
-                                            if (metric.AggregateFunction == Metric.Function.Or)
+                                            if (metric.TimeAggregateFunction == Metric.Function.Or)
                                                 newRow[metric.Abbreviation + i] = g.Where(r => r.Field<bool>(metric.Abbreviation + i) == true).Count() > 0;
-                                            else if (metric.AggregateFunction == Metric.Function.Sum)
+                                            else if (metric.TimeAggregateFunction == Metric.Function.Sum)
                                                 newRow[metric.Abbreviation + i] = g.Sum(r => r.Field<int>(metric.Abbreviation + i));
+                                            else if (metric.TimeAggregateFunction == Metric.Function.CountDistinct)
+                                                newRow[metric.Abbreviation + i] = g.Where(r => r.Field<int>(metric.Abbreviation + i) != 0).Select(r => r.Field<int>(metric.Abbreviation + i)).Distinct().Count();
                                         }
                                     }
 
@@ -244,18 +371,20 @@ namespace UtilisationCacheBuilder
 
         }
 
-        private static void PivotValue(DataRow row, Metric metric, Aggregation aggregation)
+        private static void PivotValue(DataRow row, Metric metric, TimeAggregation aggregation)
         {
             DateTime startDate = (DateTime)row["StartDate"];
+            if (metric.TimeAggregateFunction == Metric.Function.CountDistinct || metric.TimeAggregateFunction == Metric.Function.None)
+                return;
             switch (aggregation)
             {
-                case Aggregation.Day:
+                case TimeAggregation.Day:
                     row[metric.Abbreviation + startDate.Day] = row[metric.Abbreviation];
                     break;
-                case Aggregation.Weekday:
+                case TimeAggregation.Weekday:
                     row[metric.Abbreviation + GetDayOfWeek(startDate.DayOfWeek)] = row[metric.Abbreviation];
                     break;
-                case Aggregation.Month:
+                case TimeAggregation.Month:
                     row[metric.Abbreviation + startDate.Month] = row[metric.Abbreviation];
                     break;
             }
@@ -270,8 +399,10 @@ namespace UtilisationCacheBuilder
 
         private static void AppendMultiColumnAggregate(StringBuilder sb, Metric metric, int minValue, int maxValue)
         {
-            if (metric.AggregateFunction == Metric.Function.Or)
+
+            if (metric.TimeAggregateFunction == Metric.Function.Or)
             {
+                sb.Append(",");
                 for (int i = minValue; i <= maxValue; i++)
                 {
                     sb.Append(metric.Abbreviation).Append(i.ToString("D2"));
@@ -280,9 +411,9 @@ namespace UtilisationCacheBuilder
                 }
                 sb.Append(" AS ").Append(metric.Abbreviation).Append(" ");
             }
-            else
+            else if (metric.TimeAggregateFunction != Metric.Function.CountDistinct && metric.TimeAggregateFunction != Metric.Function.None)
             {
-                sb.Append("(SELECT ").Append(metric.AggregateFunction.ToString()).Append("(").Append(metric.Abbreviation).Append(") FROM (VALUES ");
+                sb.Append(",(SELECT ").Append(metric.TimeAggregateFunction.ToString()).Append("(").Append(metric.Abbreviation).Append(") FROM (VALUES ");
                 for (int i = minValue; i <= maxValue; i++)
                 {
                     sb.Append("(").Append(metric.Abbreviation).Append(i.ToString("D2")).Append(")");
@@ -292,6 +423,75 @@ namespace UtilisationCacheBuilder
                 sb.Append(") AS x(").Append(metric.Abbreviation).Append(")) AS ").Append(metric.Abbreviation);
 
             }
+
+        }
+
+        
+        private static DataTable GetAttendanceData(DateTime generateCacheFrom, TimeAggregation timeAggregation, LocationAggregation locationAggregation)
+        {
+            int minValue = 0;
+            int maxValue = 0;
+            switch (timeAggregation)
+            {
+                case (TimeAggregation.Hour):
+                    minValue = 0;
+                    maxValue = 23;
+                    break;
+                case (TimeAggregation.Day):
+                    minValue = 1;
+                    maxValue = 31;
+                    break;
+                case (TimeAggregation.Weekday):
+                    minValue = 1;
+                    maxValue = 7;
+                    break;
+                case (TimeAggregation.Month):
+                    minValue = 1;
+                    maxValue = 12;
+                    break;
+            }
+
+
+            // Get ContainerOccupancy Data To Process
+            DateTime processDate = generateCacheFrom;
+            DateTime maxDate = processDate.AddDays(1);
+            if (maxDate > CurrentTimeUTC)
+                maxDate = CurrentTimeUTC;
+            var table = GetContainerOccupancyData(processDate, maxDate);
+
+            AddLocalTimezonesAndHelperDates(table);
+            var attMetric = new Metric("Attendance", "ATT", typeof(int), Metric.SqlType.Smallint, false, Metric.Function.CountDistinct, Metric.Function.CountDistinct);
+            AddMetricColumns(table, attMetric, minValue, maxValue);
+
+            DataSet1.ContainerOccupancyRow row;
+            for (int i = 0; i < table.Rows.Count; i++)
+            {
+                if (i % 1000 == 0)
+                    Console.WriteLine("Processed " + i + " rows");
+
+                row = (DataSet1.ContainerOccupancyRow)table.Rows[i];
+                row.StartDate = new DateTime(row.ActivityStartTimeLocal.Year, row.ActivityStartTimeLocal.Month, 1);
+
+                for (int v = minValue; v <= maxValue; v++)
+                {
+                    bool isUtilised = true;
+
+                    if (isUtilised)
+                    {
+                        row["ATT" + v] = row.OccupiedByPersonID;
+                    }
+                    else
+                    {
+                        row["ATT" + v] = 0;
+                    }
+                }
+            }
+
+            var groupedTable = AggregateTable(table, locationAggregation + "ID", "StartDate", "SpaceUtilisationBy" +locationAggregation + "Per" + timeAggregation, minValue, maxValue, processDate, new List<Metric> { attMetric });
+
+            groupedTable.PrimaryKey = new DataColumn[] { groupedTable.Columns["FloorID"], groupedTable.Columns["StartDate"] };
+
+            return groupedTable;
 
         }
 
@@ -314,10 +514,7 @@ namespace UtilisationCacheBuilder
                 // Add Local Timezones & Helper Columns 
                 AddLocalTimezonesAndHelperDates(table);
                 AddMetricColumnsToTable(table, 0, 23);
-                AddMetricColumns(table, new Metric("Person ID", "PID", typeof(int), Metric.SqlType.Int, false, Metric.Function.CountDistinct), 0, 23); //PersonID this hour. 
 
-
-                //DataView dv = new DataView(table, "ActivityStartTimeLocal < '" + startDate.AddDays(1).ToString("yyyy/MM/dd") + "' AND ActivityEndTimeLocal >='" + startDate.ToString("yyyy/MM/dd") + "'", "", DataViewRowState.CurrentRows);
                 Console.WriteLine("Processing Hourly Data for: " + processDate.ToShortDateString() + " with " + table.Count + "Rows");
 
                 DataSet1.ContainerOccupancyRow row;
@@ -394,9 +591,25 @@ namespace UtilisationCacheBuilder
 
                         //PID - PersonID This Hour
                         if (isUtilised)
-                            row["PID" + hour] = row.OccupiedByPersonID;
+                        {
+                            row["PKO" + hour] = row.OccupiedByPersonID;
+                            row["ATT" + hour] = row.OccupiedByPersonID;
+                        }
                         else
-                            row["PID" + hour] = 0;
+                        {
+                            row["PKO" + hour] = 0;
+                            row["ATT" + hour] = 0;
+                        }
+
+                        // Workpoints
+                        row["WPS" + hour] = row.Workpoints;
+                        row["PWU" + hour] = row.Workpoints;
+                        row["AWU" + hour] = row.Workpoints;
+
+                        // Collaboration Spaces
+                        row["CLS" + hour] = row.Capacity;
+                        row["PCU" + hour] = row.Capacity;
+                        row["ACU" + hour] = row.Capacity;
 
                     }
 
@@ -404,22 +617,20 @@ namespace UtilisationCacheBuilder
 
                 if (table.Rows.Count > 0)
                 {
-                    var filteredTable = table.AsEnumerable().Where(r => r.Field<DateTime?>("StartDate") != null).CopyToDataTable();
+                    //var filteredTable = table.AsEnumerable().Where(r => r.Field<DateTime?>("StartDate") != null).CopyToDataTable();
 
-                    var groupedTable = AggregateTable(filteredTable, "StartDate", "SpaceUtilisationPerHour", 0, 23,HourlyCacheLastUpdatedUTC);
-
+                    var groupedTable = AggregateTable(table, "ContainerID", "StartDate", "SpaceUtilisationPerHour", 0, 23,HourlyCacheLastUpdatedUTC);
                     CommitCache2(HourlyCacheLastUpdatedUTC, groupedTable,0,23);
 
-                    filteredTable.Clear();
-                    groupedTable.Clear();
-                    filteredTable = null;
+                    groupedTable = AggregateTable(table, "FloorID", "StartDate", "SpaceUtilisationByFloorPerHour", 0, 23, HourlyCacheLastUpdatedUTC);
+                    CommitCache2(HourlyCacheLastUpdatedUTC, groupedTable, 0, 23);
+
+                    groupedTable = AggregateTable(table, "BuildingID", "StartDate", "SpaceUtilisationByBuildingPerHour", 0, 23, HourlyCacheLastUpdatedUTC);
+                    CommitCache2(HourlyCacheLastUpdatedUTC, groupedTable, 0, 23);
+
                     groupedTable = null;
                 }
 
-                table.Clear();
-           
-                table.Dispose();
-              
                 table = null;
          
             }
@@ -537,13 +748,14 @@ namespace UtilisationCacheBuilder
 
         private static void CommitCache2(DateTime generateCacheFrom, DataTable table, int minValue, int maxValue)
         {
+            string locationID = table.Columns[0].ColumnName;
 
-            Dictionary<int, DateTime> latestStartDateCachedForContainer = new Dictionary<int, DateTime>();
+            Dictionary<int, DateTime> latestStartDateCachedForLocation = new Dictionary<int, DateTime>();
             using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
             {
-                var getLatestCachedStartDatePerBuidlingSQL = @"select ContainerID,MAX(StartDate) as LatestCachedStartDate
+                var getLatestCachedStartDatePerBuidlingSQL = @"select " + locationID + @",MAX(StartDate) as LatestCachedStartDate
                     FROM[" + table.TableName + @"]
-                    GROUP BY ContainerID";
+                    GROUP BY " + locationID;
 
                 using (SqlCommand cmd = new SqlCommand(getLatestCachedStartDatePerBuidlingSQL, sqlConn))
                 {
@@ -551,7 +763,7 @@ namespace UtilisationCacheBuilder
                     var sqlReader = cmd.ExecuteReader();
                     while (sqlReader.Read())
                     {
-                        latestStartDateCachedForContainer.Add((int)sqlReader["ContainerID"], (DateTime)sqlReader["LatestCachedStartDate"]);
+                        latestStartDateCachedForLocation.Add((int)sqlReader[locationID], (DateTime)sqlReader["LatestCachedStartDate"]);
                     }
                     sqlConn.Close();
                 }
@@ -567,8 +779,8 @@ namespace UtilisationCacheBuilder
             {
                 row = table.Rows[rowCount];
 
-                if (latestStartDateCachedForContainer.ContainsKey((int)row["ContainerID"]) &&
-                    (DateTime)row["StartDate"] <= latestStartDateCachedForContainer[(int)row["ContainerID"]]) // update that exist in cache
+                if (latestStartDateCachedForLocation.ContainsKey((int)row[locationID]) &&
+                    (DateTime)row["StartDate"] <= latestStartDateCachedForLocation[(int)row[locationID]]) // update that exist in cache
                 {
                     {
 
@@ -616,7 +828,7 @@ namespace UtilisationCacheBuilder
 
                             sb.Remove(sb.Length - 1, 1);
 
-                            sb.Append(" WHERE [ContainerID]=").Append(row["ContainerID"]).Append(" AND [StartDate] = '").Append(((DateTime)row["StartDate"]).ToString("yyyy/MM/dd")).Append("';");
+                            sb.Append(" WHERE [").Append(locationID).Append("]= ").Append(row[locationID]).Append(" AND [StartDate] = '").Append(((DateTime)row["StartDate"]).ToString("yyyy/MM/dd")).Append("';");
 
                         }
                         row.Delete();
@@ -664,7 +876,7 @@ namespace UtilisationCacheBuilder
 
 
 
-        private static void CreateMetricsTable(string tableName, int minValue, int maxValue)
+        private static void CreateMetricsTable(string tableName, string locationID, int minValue, int maxValue)
         {
             var sb = new StringBuilder();
 
@@ -672,14 +884,14 @@ namespace UtilisationCacheBuilder
                 @" IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='" + tableName + @"' AND xtype='U')
                 
                     CREATE TABLE [dbo].[" + tableName + @"]( 
-                    [ContainerID] [int] NOT NULL,
+                    [" + locationID + @"] [int] NOT NULL,
                     [StartDate] [smalldatetime] NOT NULL,"
                 );
 
 
             CreateMetricsColumns(sb, minValue, maxValue);
 
-            sb.Append(" CONSTRAINT PK_").Append(tableName).Append("_ContainerID_StartDate PRIMARY KEY CLUSTERED (ContainerID,StartDate))");
+            sb.Append(" CONSTRAINT PK_").Append(tableName).Append("_").Append(locationID).Append("_StartDate PRIMARY KEY CLUSTERED (").Append(locationID).Append(", StartDate))");
 
             using (SqlConnection sqlConn = new SqlConnection(ConnectionString))
             {
