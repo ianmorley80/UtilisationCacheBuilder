@@ -267,25 +267,91 @@ namespace UtilisationCacheBuilder
 
                 if (table.Rows.Count > 0)
                 {
-                    //var filteredTable = table.AsEnumerable().Where(r => r.Field<DateTime?>("StartDate") != null).CopyToDataTable();
-
+                    // Commit HourlyCacheByContainer
                     var groupedTable = AggregateTable(table, "ContainerID", "StartDate", "SpaceUtilisationPerHour", 0, 23, HourlyCacheLastUpdatedUTC);
                     CommitCache2(HourlyCacheLastUpdatedUTC, groupedTable, 0, 23);
 
+                    // Commit HourlyCacheByFloor
                     groupedTable = AggregateTable(table, "FloorID", "StartDate", "SpaceUtilisationByFloorPerHour", 0, 23, HourlyCacheLastUpdatedUTC);
                     CommitCache2(HourlyCacheLastUpdatedUTC, groupedTable, 0, 23);
 
+                    // Commit HourlyCacheByBuilding
                     groupedTable = AggregateTable(table, "BuildingID", "StartDate", "SpaceUtilisationByBuildingPerHour", 0, 23, HourlyCacheLastUpdatedUTC);
                     CommitCache2(HourlyCacheLastUpdatedUTC, groupedTable, 0, 23);
 
-                    groupedTable = null;
+                    groupedTable = null; //release memory
                 }
 
-                table = null;
+                table = null; //release memory
 
             }
         }
 
+
+
+        private static void GenerateAggregatedTimeCache(TimeWindow timeAggregation)
+        {
+            DateTime generateCacheFrom = HourlyCacheLastUpdatedUTC;
+            int minValue = 0;
+            int maxValue = 0;
+            string groupByDate = "";
+
+            switch (timeAggregation)
+            {
+                case TimeWindow.Day:
+                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddHours(-36); // Max UTC offset of -12 then another day
+                    generateCacheFrom = generateCacheFrom.AddHours(generateCacheFrom.Hour * -1); // start of that day. 
+                    minValue = 1;
+                    maxValue = 31;
+                    groupByDate = "StartOfMonth";
+                    break;
+                case TimeWindow.Weekday:
+                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddHours(-36); // Max UTC offset of -12 then another day
+                    generateCacheFrom = generateCacheFrom.AddHours(generateCacheFrom.Hour * -1); // start of that day. 
+                    minValue = 1;
+                    maxValue = 7;
+                    groupByDate = "StartOfWeek";
+                    break;
+                case TimeWindow.Month:
+                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddMonths(-1).AddDays(HourlyCacheLastUpdatedUTC.Day).AddHours(HourlyCacheLastUpdatedUTC.Hour).AddMinutes(HourlyCacheLastUpdatedUTC.Minute);
+                    minValue = 1;
+                    maxValue = 12;
+                    groupByDate = "StartOfYear";
+                    break;
+            }
+
+            StringBuilder sb = new StringBuilder();
+            sb.Append(@"SELECT su.ContainerID,StartDate, tz.Name as 'TimeZone',
+                DATEFROMPARTS(YEAR(StartDate),1,1) as StartOfYear,
+                DATEFROMPARTS(YEAR(StartDate), MONTH(StartDate), 1) as StartofMonth,
+                DATEADD(ww, DATEDIFF(ww, 0, StartDate), 0) as StartOfWeek");
+
+            for (int i = 0; i < Metrics.Count; i++)
+            {
+                AppendMultiColumnAggregate(sb, Metrics[i], 0, 23);
+            }
+
+            sb.Append(" FROM [SpaceUtilisationPerHour] su INNER JOIN [Container] c ON (su.ContainerID = c.ContainerID) INNER JOIN [Building] b ON (c.BuildingID = b.BuildingID) LEFT OUTER JOIN tzdb.Zones tz ON (b.TimeZoneID = tz.ID)  WHERE StartDate >='").Append(generateCacheFrom.ToString("yyyy/MM/dd HH:mm")).Append("'");
+
+            Console.WriteLine("Prosessing Aggregate Data for " + timeAggregation + " beginning " + generateCacheFrom);
+
+            var table = GetData(sb.ToString());
+
+            AddMetricColumnsToTable(table, minValue, maxValue);
+
+            PivotTable(table, timeAggregation);
+
+            var aggregatedTable = AggregateTable(table, "ContainerID", groupByDate, "SpaceUtilisationPer" + timeAggregation, minValue, maxValue, generateCacheFrom);
+
+            // Commit Container Cache for this TimeWindow
+            CommitCache2(generateCacheFrom, aggregatedTable, minValue, maxValue);
+
+            // Generate Floor Cache for this TimeWindow
+            GenerateAggregatedLocationCache(Area.Floor, generateCacheFrom, timeAggregation);
+
+            // Generate Building Cache for this TimeWindow
+            GenerateAggregatedLocationCache(Area.Building, generateCacheFrom, timeAggregation);
+        }
 
         private static void GenerateAggregatedLocationCache(Area locationAggregation, DateTime generateCacheFrom, TimeWindow timeAggregation)
         {
@@ -350,69 +416,8 @@ namespace UtilisationCacheBuilder
 
         }
 
-        private static void GenerateAggregatedTimeCache(TimeWindow timeAggregation)
-        {
-            DateTime generateCacheFrom = HourlyCacheLastUpdatedUTC;
-            int minValue = 0;
-            int maxValue = 0;
-            string groupByDate = "";
-
-            switch (timeAggregation)
-            {
-                case TimeWindow.Day:
-                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddHours(-36); // Max UTC offset of -12 then another day
-                    generateCacheFrom = generateCacheFrom.AddHours(generateCacheFrom.Hour * -1); // start of that day. 
-                    minValue = 1;
-                    maxValue = 31;
-                    groupByDate = "StartOfMonth";
-                    break;
-                case TimeWindow.Weekday:
-                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddHours(-36); // Max UTC offset of -12 then another day
-                    generateCacheFrom = generateCacheFrom.AddHours(generateCacheFrom.Hour * -1); // start of that day. 
-                    minValue = 1;
-                    maxValue = 7;
-                    groupByDate = "StartOfWeek";
-                    break;
-                case TimeWindow.Month:
-                    generateCacheFrom = HourlyCacheLastUpdatedUTC.AddMonths(-1).AddDays(HourlyCacheLastUpdatedUTC.Day).AddHours(HourlyCacheLastUpdatedUTC.Hour).AddMinutes(HourlyCacheLastUpdatedUTC.Minute);
-                    minValue = 1;
-                    maxValue = 12;
-                    groupByDate = "StartOfYear";
-                    break;
-            }
-
-            StringBuilder sb = new StringBuilder();
-            sb.Append(@"SELECT su.ContainerID,StartDate, tz.Name as 'TimeZone',
-                DATEFROMPARTS(YEAR(StartDate),1,1) as StartOfYear,
-                DATEFROMPARTS(YEAR(StartDate), MONTH(StartDate), 1) as StartofMonth,
-                DATEADD(ww, DATEDIFF(ww, 0, StartDate), 0) as StartOfWeek");
-
-            for (int i = 0; i < Metrics.Count; i++)
-            {
-                AppendMultiColumnAggregate(sb, Metrics[i], 0, 23);
-            }
-
-            sb.Append(" FROM [SpaceUtilisationPerHour] su INNER JOIN [Container] c ON (su.ContainerID = c.ContainerID) INNER JOIN [Building] b ON (c.BuildingID = b.BuildingID) LEFT OUTER JOIN tzdb.Zones tz ON (b.TimeZoneID = tz.ID)  WHERE StartDate >='").Append(generateCacheFrom.ToString("yyyy/MM/dd HH:mm")).Append("'");
-
-            Console.WriteLine("Prosessing Aggregate Data for " + timeAggregation + " beginning " + generateCacheFrom);
-
-            var table = GetData(sb.ToString());
 
 
-            AddMetricColumnsToTable(table, minValue, maxValue);
-
-            PivotTable(table, timeAggregation);
-
-            var aggregatedTable = AggregateTable(table, "ContainerID", groupByDate, "SpaceUtilisationPer" + timeAggregation, minValue, maxValue, generateCacheFrom);
-
-            CommitCache2(generateCacheFrom, aggregatedTable, minValue, maxValue);
-
-            // GenerateLocationCache
-            GenerateAggregatedLocationCache(Area.Floor, generateCacheFrom, timeAggregation);
-            GenerateAggregatedLocationCache(Area.Building, generateCacheFrom, timeAggregation);
-
-
-        }
 
         #endregion
 
@@ -621,29 +626,13 @@ namespace UtilisationCacheBuilder
             return table;
         }
 
-        private static DataTable GetAttendanceData(DateTime generateCacheFrom, TimeWindow timeAggregation, Area locationAggregation)
+        private static DataTable GetAttendanceData(DateTime generateCacheFrom, TimeWindow window, Area area)
         {
-            int minValue = 0;
-            int maxValue = 0;
-            switch (timeAggregation)
-            {
-                case (TimeWindow.Hour):
-                    minValue = 0;
-                    maxValue = 23;
-                    break;
-                case (TimeWindow.Day):
-                    minValue = 1;
-                    maxValue = 31;
-                    break;
-                case (TimeWindow.Weekday):
-                    minValue = 1;
-                    maxValue = 7;
-                    break;
-                case (TimeWindow.Month):
-                    minValue = 1;
-                    maxValue = 12;
-                    break;
-            }
+            int minValue = GetMinValue(window);
+            int maxValue = GetMaxValue(window);
+            var locationID = String.Format("{0}ID", area);
+            var byString = area == Area.Container ? String.Empty : "By" + area.ToString();
+            var tableName = String.Format("SpaceUtilisation{0}Per{1}", byString, window.ToString());
 
 
             // Get ContainerOccupancy Data To Process
@@ -664,10 +653,37 @@ namespace UtilisationCacheBuilder
                     Console.WriteLine("Processed " + i + " rows");
 
                 row = (DataSet1.ContainerOccupancyRow)table.Rows[i];
-                row.StartDate = new DateTime(row.ActivityStartTimeLocal.Year, row.ActivityStartTimeLocal.Month, 1);
+                switch(window)
+                {
+                    case TimeWindow.Day:
+                        row.StartDate = new DateTime(row.ActivityStartTimeLocal.Year, row.ActivityStartTimeLocal.Month, 1);
+                        break;
+                    case TimeWindow.Weekday:
+                        row.StartDate = new DateTime(row.ActivityStartTimeLocal.Year, row.ActivityStartTimeLocal.Month, row.ActivityStartTimeLocal.Day - Convert.ToInt32(row.ActivityStartTimeLocal.DayOfWeek));
+                        break;
+                    case TimeWindow.Month:
+                        row.StartDate = new DateTime(row.ActivityStartTimeLocal.Year, 1, 1);
+                        break;
+                }
 
                 for (int v = minValue; v <= maxValue; v++)
                 {
+                    DateTime periodStartTime;
+                    DateTime periodEndTime;
+                    
+                    switch(window)
+                    {
+                        case TimeWindow.Day:
+                        case TimeWindow.Weekday:
+                            periodStartTime = row.StartDate.AddDays(v);
+                            periodEndTime = row.StartDate.AddDays(v + 1);
+                            break;
+                        case TimeWindow.Month:
+                            periodStartTime = row.StartDate.AddMonths(v);
+                            periodEndTime = row.StartDate.AddMonths(v + 1);
+                            break;
+                    }
+
                     bool isUtilised = true;
 
                     if (isUtilised)
@@ -681,7 +697,7 @@ namespace UtilisationCacheBuilder
                 }
             }
 
-            var groupedTable = AggregateTable(table, locationAggregation + "ID", "StartDate", "SpaceUtilisationBy" + locationAggregation + "Per" + timeAggregation, minValue, maxValue, processDate, new List<Metric> { attMetric });
+            var groupedTable = AggregateTable(table, locationID, "StartDate", tableName, minValue, maxValue, processDate, new List<Metric> { attMetric });
 
             groupedTable.PrimaryKey = new DataColumn[] { groupedTable.Columns["FloorID"], groupedTable.Columns["StartDate"] };
 
