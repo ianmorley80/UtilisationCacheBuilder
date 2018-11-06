@@ -158,7 +158,6 @@ namespace UtilisationCacheBuilder
             DateTime endPeriod;
             DateTime? utilisationStart = null;
             DateTime? utilisationEnd = null;
-            bool isUtilised;
             int minutesUtilised;
             int occupantMinutes = 0;
             Stopwatch stopwatch = new Stopwatch();
