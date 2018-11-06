@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using System.Data;
 using System.Data.SqlClient;
 using NodaTime;
+using System.Diagnostics;
 
 namespace UtilisationCacheBuilder
 {
@@ -36,6 +37,8 @@ namespace UtilisationCacheBuilder
             return; 
 
             GenerateAggregatedTimeCache(TimeWindow.Day);
+
+            return;
             GenerateAggregatedTimeCache(TimeWindow.Weekday);
             SetCacheLastUpdated(CachePeriod.Hourly);
 
@@ -106,8 +109,10 @@ namespace UtilisationCacheBuilder
                 cmd.Connection.Close();
             }
 
-            HourlyCacheLastUpdatedUTC = CurrentTimeUTC.AddMonths(-3).AddDays(CurrentTimeUTC.Day * -1).AddHours(CurrentTimeUTC.Hour * -1).AddMinutes(CurrentTimeUTC.Minute * -1); // by default go back 3 months. 
-            MonthlyCacheLastUpdatedUTC = HourlyCacheLastUpdatedUTC;
+            if (HourlyCacheLastUpdatedUTC == null)
+                HourlyCacheLastUpdatedUTC = CurrentTimeUTC.AddMonths(-3).AddDays(CurrentTimeUTC.Day * -1).AddHours(CurrentTimeUTC.Hour * -1).AddMinutes(CurrentTimeUTC.Minute * -1); // by default go back 3 months. 
+            if (MonthlyCacheLastUpdatedUTC == null)
+                MonthlyCacheLastUpdatedUTC = HourlyCacheLastUpdatedUTC;
 
             // create collection of Metrics that we're going to calculate. 
             Metrics = new List<Metric>();
@@ -149,9 +154,19 @@ namespace UtilisationCacheBuilder
         {
             // Hourly Cache is updated for every hour. 
 
+            DateTime startPeriod;
+            DateTime endPeriod;
+            DateTime? utilisationStart = null;
+            DateTime? utilisationEnd = null;
+            bool isUtilised;
+            int minutesUtilised;
+            int occupantMinutes = 0;
+            Stopwatch stopwatch = new Stopwatch();
+
             // To save on memory, process one UTC day's worth of data at a time. 
             for (int dayCount = 0; dayCount <= CurrentTimeUTC.Date.Subtract(HourlyCacheLastUpdatedUTC.Date).TotalDays; dayCount++)
             {
+                stopwatch.Start();
                 //DateTime startDate = generateCacheFrom.AddDays(dayCount);
 
                 // Get ContainerOccupancy Data To Process
@@ -168,102 +183,73 @@ namespace UtilisationCacheBuilder
                 Console.WriteLine("Processing Hourly Data for: " + processDate.ToShortDateString() + " with " + table.Count + "Rows");
 
                 DataSet1.ContainerOccupancyRow row;
-                for (int i = 0; i < table.Rows.Count; i++)
+                //Parallel.ForEach(table.AsEnumerable(), row =>
+                for(int i = 0; i < table.Rows.Count; i++)
                 {
                     if (i % 1000 == 0)
-                        Console.WriteLine("Processed " + i + " rows");
+                        Console.WriteLine(String.Format("Processed {0} Rows ({1:0}% Complete)",i,(double)i/table.Rows.Count*100.00));
 
                     row = (DataSet1.ContainerOccupancyRow)table.Rows[i];
                     row.StartDate = new DateTime(row.ActivityStartTimeLocal.Year, row.ActivityStartTimeLocal.Month, row.ActivityStartTimeLocal.Day);
 
                     for (int hour = 0; hour <= 23; hour++)
                     {
-                        //Utilisation Start Time
-                        DateTime? utilisationStart = null;
-                        if ((row.ActivityStartsPreviousDay || (row.ActivityStartedToday && row.ActivityStartTimeLocal.Hour < hour)) &&
-                            (row.UtilisationEndsFutureDay || (row.ActivityStartedToday && row.UtilisationEndTimeLocal.Hour >= hour)))
-                            utilisationStart = new DateTime(row.ActivityStartTimeLocal.Year, row.ActivityStartTimeLocal.Month, row.ActivityStartTimeLocal.Day, hour, 0, 0);
-                        else if (row.ActivityStartedToday && row.ActivityStartTimeLocal.Hour == hour)
-                            utilisationStart = row.ActivityStartTimeLocal;
+                        startPeriod = row.StartDate.AddHours(hour);
+                        endPeriod = row.StartDate.AddHours(hour + 1);
 
-                        if (utilisationStart != null)
+                        // Record Workpoints & Collaboration Spaces
+                        row["WPS" + hour] = row.Workpoints;
+                        row["CLS" + hour] = row.Capacity;
+
+                        //Utilisation Start Time
+                        if (row.ActivityEndTimeLocal > startPeriod && row.ActivityStartTimeLocal <= endPeriod) // isUtilized
+                        {
+                            //Utilisation Start Time
+                            if (row.ActivityStartTimeLocal <= startPeriod)
+                                utilisationStart = startPeriod;
+                            else
+                                utilisationStart = row.ActivityStartTimeLocal;
+
                             row["UST" + hour] = utilisationStart;
 
-                        // UTZ - Utilized
-                        bool isUtilised = utilisationStart != null;
-                        row["UTI" + hour] = isUtilised;
+                            //Utilized
+                            row["UTI" + hour] = true;
 
+                            //Utilisation End Time
+                            if (row.ActivityEndTimeLocal > endPeriod)
+                                utilisationEnd = endPeriod;
+                            else
+                                utilisationEnd = row.ActivityEndTimeLocal;
+                            row["UET" + hour] = utilisationEnd;
 
-                        //Utilisation End Time
-                        DateTime? utilisationEnd = null;
-                        if (utilisationStart != null)
-                        {
-                            if (row.UtilisationEndsFutureDay || (row.UtilisationEndsToday && row.UtilisationEndTimeLocal.Hour > hour))
-                                utilisationEnd = row.StartDate.AddHours(hour + 1);
-                            else if (row.UtilisationEndsToday && row.UtilisationEndTimeLocal.Hour == hour)
-                                utilisationEnd = row.UtilisationEndTimeLocal;
-
-                            if (utilisationEnd != null)
-                                row["UET" + hour] = utilisationEnd;
-                        }
-
-                        // MIU - Minutes Utilized
-                        int minutesUtilised = 0;
-                        if (utilisationStart != null)
+                            // MIU - Minutes Utilized
                             minutesUtilised = Convert.ToInt32(Math.Ceiling(utilisationEnd.Value.Subtract(utilisationStart.Value).TotalMinutes));
-                        row["MIU" + hour] = minutesUtilised;
+                            row["MIU" + hour] = minutesUtilised;
 
-                        // WPU - Workpoints Utilized
-                        int workpointsUtilised = 0;
-                        if (row.Workpoints > 0 && isUtilised)
-                            workpointsUtilised = row.Workpoints;
-                        row["WPU" + hour] = workpointsUtilised;
+                            // WPU - Workpoints Utilized
+                            if (row.Workpoints > 0)
+                                row["WPU" + hour] = row["PWU" + hour] = row["AWU" + hour] = row.Workpoints;
 
-                        // CSU - Collaboration Spaces Utilized
-                        int collaborationUtilised = 0;
-                        if (row.Capacity > 0 && isUtilised)
-                            collaborationUtilised = 1;
-                        row["CSU" + hour] = collaborationUtilised;
+                            // CSU - Collaboration Spaces Utilized
+                            if (row.Capacity > 0)
+                                row["CSU" + hour] = row["PCU" + hour] = row["ACU" + hour] = 1;
 
-                        //OCM - Occupant Minutes
-                        int occupantMinutes = 0;
-                        if (row.ActivityStartedToday && row.ActivityStartTimeLocal.Hour == hour && row.OccupancyEndTimeLocal.Hour == hour && row.OccupancyEndsToday) // Activity Started and Ended this Hour
-                            occupantMinutes = row.OccupancyEndTimeLocal.Minute - row.ActivityStartTimeLocal.Minute;
-                        else if ((row.ActivityStartsPreviousDay || row.ActivityStartTimeLocal.Hour < hour) && row.OccupancyEndTimeLocal.Hour == hour) // Activity Started in the Past and Ended this Hour
-                            occupantMinutes = row.OccupancyEndTimeLocal.Minute;
-                        else if ((row.ActivityStartsPreviousDay || row.ActivityStartTimeLocal.Hour < hour) && (row.OccupancyEndTimeLocal.Hour > hour || row.OccupancyEndsFutureDay)) // Activity started in the Past and Ended in a Future Hour
-                            occupantMinutes = 60;
-                        else if ((row.ActivityStartedToday && row.ActivityStartTimeLocal.Hour == hour) && (row.OccupancyEndTimeLocal.Hour > hour || row.OccupancyEndsFutureDay)) // Activity started this Hour and Ended in a Future Hour
-                            occupantMinutes = 60 - row.ActivityStartTimeLocal.Minute;
-                        else
-                            occupantMinutes = 0; // No Activity this Hour
-                        row["OCM" + hour] = occupantMinutes;
+                            // OCM - Occupant Minutes
+                            if (row.OccupancyEndTimeLocal > endPeriod)
+                                occupantMinutes = Convert.ToInt32(Math.Ceiling(endPeriod.Subtract(utilisationStart.Value).TotalMinutes));
+                            else
+                                occupantMinutes = Convert.ToInt32(Math.Ceiling(row.OccupancyEndTimeLocal.Subtract(utilisationStart.Value).TotalMinutes));
+                            row["OCM" + hour] = occupantMinutes;
 
-                        //PID - PersonID This Hour
-                        if (isUtilised)
-                        {
-                            row["PKO" + hour] = row.OccupiedByPersonID;
-                            row["ATT" + hour] = row.OccupiedByPersonID;
+
+                            //PID - PersonID This Hour
+                            row["PKO" + hour] = row["ATT" + hour] = row.OccupiedByPersonID;
                         }
-                        else
-                        {
-                            row["PKO" + hour] = 0;
-                            row["ATT" + hour] = 0;
-                        }
-
-                        // Workpoints
-                        row["WPS" + hour] = row.Workpoints;
-                        row["PWU" + hour] = row.Workpoints;
-                        row["AWU" + hour] = row.Workpoints;
-
-                        // Collaboration Spaces
-                        row["CLS" + hour] = row.Capacity;
-                        row["PCU" + hour] = row.Capacity;
-                        row["ACU" + hour] = row.Capacity;
 
                     }
 
                 }
+
 
                 if (table.Rows.Count > 0)
                 {
@@ -283,6 +269,9 @@ namespace UtilisationCacheBuilder
                 }
 
                 table = null; //release memory
+
+                stopwatch.Stop();
+                Console.WriteLine("Process Time: " + stopwatch.Elapsed.ToString());
 
             }
         }
@@ -537,12 +526,22 @@ namespace UtilisationCacheBuilder
                                         }
                                         else
                                         {
-                                            if (metric.TimeAggregateFunction == Metric.Function.Or)
-                                                newRow[metric.Abbreviation + i] = g.Where(r => r.Field<bool>(metric.Abbreviation + i) == true).Count() > 0;
-                                            else if (metric.TimeAggregateFunction == Metric.Function.Sum)
-                                                newRow[metric.Abbreviation + i] = g.Sum(r => r.Field<int>(metric.Abbreviation + i));
-                                            else if (metric.TimeAggregateFunction == Metric.Function.CountDistinct)
-                                                newRow[metric.Abbreviation + i] = g.Where(r => r.Field<int>(metric.Abbreviation + i) != 0).Select(r => r.Field<int>(metric.Abbreviation + i)).Distinct().Count();
+                                            switch(metric.TimeAggregateFunction)
+                                            {
+                                                case Metric.Function.Or:
+                                                    newRow[metric.Abbreviation + i] = g.Where(r => r.Field<bool>(metric.Abbreviation + i) == true).Count() > 0;
+                                                    break;
+                                                case Metric.Function.Sum:
+                                                    newRow[metric.Abbreviation + i] = g.Sum(r => r.Field<int>(metric.Abbreviation + i));
+                                                    break;
+                                                case Metric.Function.Max:
+                                                    newRow[metric.Abbreviation + i] = g.Max(r => r.Field<int>(metric.Abbreviation + i));
+                                                    break;
+                                                case Metric.Function.CountDistinct:
+                                                    newRow[metric.Abbreviation + i] = g.Where(r => r.Field<int>(metric.Abbreviation + i) != 0).Select(r => r.Field<int>(metric.Abbreviation + i)).Distinct().Count();
+                                                    break;
+
+                                            }
                                         }
                                     }
 
