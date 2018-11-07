@@ -14,6 +14,11 @@
 
         partial class ContainerOccupancyRow
         {
+            public bool IsUtilizedBetween(System.DateTime startPeriod, System.DateTime endPeriod)
+            {
+                return this.ActivityEndTimeLocal >= startPeriod && this.ActivityStartTimeLocal <= endPeriod;
+            }
+
             public bool ActivityStartsPreviousDay
             {
                 get
